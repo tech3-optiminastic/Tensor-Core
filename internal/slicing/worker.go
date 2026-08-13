@@ -7,15 +7,18 @@ package slicing
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/riverqueue/river"
 
 	"github.com/Optiminastic/tensor-core/internal/db"
+	"github.com/Optiminastic/tensor-core/internal/meshio"
 	"github.com/Optiminastic/tensor-core/internal/orientation"
 	"github.com/Optiminastic/tensor-core/internal/storage"
 )
@@ -103,7 +106,7 @@ func (w *SliceWorker) slice(ctx context.Context, args SliceArgs) (PerUnitMetrics
 	// error or unsupported format (STEP) just leaves the recommendation absent.
 	orient := w.recommendOrientation(stlPath, args.StlKey)
 
-	profiles, err := ResolveProfiles(w.bambuRoot, args.Material, args.Quality)
+	profiles, err := w.resolveProfiles(ctx, args)
 	if err != nil {
 		return PerUnitMetrics{}, err
 	}
@@ -117,9 +120,21 @@ func (w *SliceWorker) slice(ctx context.Context, args SliceArgs) (PerUnitMetrics
 		infill = defaultInfillPct
 	}
 
-	out, err := RunSlice(ctx, w.bambuRoot, profiles, stlPath, infill, units, workdir, w.sliceTimeout)
+	out, err := RunSlice(ctx, w.bambuRoot, profiles, stlPath, infill, units, args.Settings, workdir, w.sliceTimeout)
 	if err != nil {
-		return PerUnitMetrics{}, err
+		// Bambu Studio's CLI rejects some 3MFs it cannot parse (e.g. a foreign
+		// PrusaSlicer/Slic3r project 3MF), even though our own mesh loader reads
+		// them. Rebuild a clean STL from the mesh and slice that: geometry and cost
+		// are preserved; the slice is single-material (fine on the single-nozzle H2S).
+		fallback, ok := w.fallbackSTL(stlPath, args.StlKey, workdir)
+		if !ok {
+			return PerUnitMetrics{}, err
+		}
+		w.logger.Info("retrying slice via normalised STL", "key", args.StlKey, "reason", err)
+		out, err = RunSlice(ctx, w.bambuRoot, profiles, fallback, infill, units, args.Settings, workdir, w.sliceTimeout)
+		if err != nil {
+			return PerUnitMetrics{}, err
+		}
 	}
 
 	result, err := LoadResultJSON(out.ResultJSONPath)
@@ -146,6 +161,88 @@ func (w *SliceWorker) slice(ctx context.Context, args SliceArgs) (PerUnitMetrics
 	perUnit := ToPerUnit(metrics, units, w.printerAvgPowerKW, gcodeKey)
 	perUnit.Orientation = orient
 	return perUnit, nil
+}
+
+// machineFilament is one entry of a machine's supported_filaments jsonb.
+type machineFilament struct {
+	Material       string  `json:"material"`
+	FilamentPreset string  `json:"filament_preset"`
+	Density        float64 `json:"density"`
+	IsDefault      bool    `json:"is_default"`
+}
+
+// resolveProfiles picks the Bambu profiles for a slice: machine-driven when the
+// job carries a MachineID (the machine's family/nozzle/filament + the requested
+// layer height), else the legacy fixed H2S 0.4 profile so old designs still slice.
+func (w *SliceWorker) resolveProfiles(ctx context.Context, args SliceArgs) (ResolvedProfiles, error) {
+	if args.MachineID == nil {
+		return ResolveProfiles(w.bambuRoot, args.Material, args.Quality)
+	}
+	cfg, err := w.store.Q.GetMachineConfig(ctx, *args.MachineID)
+	if err != nil {
+		return ResolvedProfiles{}, fmt.Errorf("load machine config: %w", err)
+	}
+	preset, density, err := pickFilament(cfg.SupportedFilaments, args.FilamentPreset, args.Material)
+	if err != nil {
+		return ResolvedProfiles{}, err
+	}
+	layerHeight := 0.20
+	if args.Settings.LayerHeightMM != nil {
+		layerHeight = *args.Settings.LayerHeightMM
+	}
+	return ResolveMachineProfiles(w.bambuRoot, cfg.Family, cfg.NozzleMm, preset, density, layerHeight)
+}
+
+// pickFilament chooses which of a machine's filaments to slice with: the explicit
+// chosen preset if given, else the one whose material matches the design's, else
+// the machine's default (or first).
+func pickFilament(raw []byte, chosenPreset, material string) (string, float64, error) {
+	var options []machineFilament
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &options)
+	}
+	if len(options) == 0 {
+		return "", 0, fmt.Errorf("machine has no supported filaments")
+	}
+	if chosenPreset != "" {
+		for _, f := range options {
+			if f.FilamentPreset == chosenPreset {
+				return f.FilamentPreset, f.Density, nil
+			}
+		}
+		return "", 0, fmt.Errorf("machine does not support filament %q", chosenPreset)
+	}
+	material = strings.ToUpper(strings.TrimSpace(material))
+	fallback := options[0]
+	for _, f := range options {
+		if f.IsDefault {
+			fallback = f
+		}
+		if material != "" && strings.HasPrefix(strings.ToUpper(f.Material), material) {
+			return f.FilamentPreset, f.Density, nil
+		}
+	}
+	return fallback.FilamentPreset, fallback.Density, nil
+}
+
+// fallbackSTL rebuilds a clean binary STL from a 3MF the slicer could not parse,
+// to recover foreign/complex 3MFs (e.g. PrusaSlicer projects). It returns false
+// when the model is not a 3MF or its mesh cannot be read, so the caller keeps the
+// original slice failure. The rebuilt STL is geometry only - correct for costing,
+// single-material on the single-nozzle H2S.
+func (w *SliceWorker) fallbackSTL(modelPath, stlKey, workdir string) (string, bool) {
+	if !strings.EqualFold(filepath.Ext(stlKey), ".3mf") {
+		return "", false
+	}
+	mesh, err := orientation.LoadModel(modelPath, filepath.Ext(stlKey))
+	if err != nil || len(mesh.Triangles) == 0 {
+		return "", false
+	}
+	outPath := filepath.Join(workdir, "model-normalised.stl")
+	if err := os.WriteFile(outPath, meshio.ConcatBinarySTL("tensor", mesh.Triangles), 0o600); err != nil {
+		return "", false
+	}
+	return outPath, true
 }
 
 // recommendOrientation reads the model mesh and computes the least-support

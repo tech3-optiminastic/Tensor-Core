@@ -4,27 +4,90 @@
 -- name: InsertDesign :one
 INSERT INTO designs (
     id, brand_slug, name, created_by, status, stl_key,
-    material, colour, finish, units_per_bed, quality, infill_pct
+    material, colour, finish, units_per_bed, quality, infill_pct, notes, preview_key, sku, machine_id, attributes
 ) VALUES (
     sqlc.arg('id'), sqlc.arg('brand_slug'), sqlc.arg('name'), sqlc.arg('created_by'),
     sqlc.arg('status'), sqlc.arg('stl_key'), sqlc.arg('material'), sqlc.narg('colour'),
     sqlc.arg('finish'), sqlc.arg('units_per_bed'), sqlc.arg('quality'),
-    sqlc.arg('infill_pct')::float8
+    sqlc.arg('infill_pct')::float8, sqlc.narg('notes'), sqlc.arg('preview_key'), sqlc.narg('sku'),
+    sqlc.narg('machine_id'), sqlc.narg('attributes')
 )
 RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
-          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-          created_at, updated_at;
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, created_at, updated_at;
+
+-- NextDesignSkuSeq draws the next value for an auto-generated SKU's numeric suffix.
+-- name: NextDesignSkuSeq :one
+SELECT nextval('designs_sku_seq')::bigint AS seq;
 
 -- name: GetDesignByID :one
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
-       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+       preview_key, sku, machine_id, personalisation_rules, attributes,
+       personalisation, personalised_stl_key, created_at, updated_at
 FROM designs WHERE id = $1;
+
+-- SetDesignPersonalisation stores the applied personalisation spec and the baked
+-- STL key for a design (or clears both with NULLs). Returns the updated row.
+-- name: SetDesignPersonalisation :one
+UPDATE designs
+SET personalisation = sqlc.narg('personalisation'),
+    personalised_stl_key = sqlc.narg('personalised_stl_key'),
+    updated_at = now()
+WHERE id = sqlc.arg('id')
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, machine_id, personalisation_rules, attributes,
+          personalisation, personalised_stl_key, created_at, updated_at;
+
+-- GetDesignBrandSlug returns only a design's brand, for the cheap per-request
+-- brand-access gate on the /:id sub-routes (no need to load the whole row).
+-- name: GetDesignBrandSlug :one
+SELECT brand_slug FROM designs WHERE id = $1;
+
+-- DeleteDesign removes a design; every child row (jobs, metrics, pricing, reviews,
+-- optimisations, attributes) is ON DELETE CASCADE, so this one statement is enough.
+-- name: DeleteDesign :execrows
+DELETE FROM designs WHERE id = $1;
+
+-- ListDesignCostReport lists a brand's priced designs with their Design CP,
+-- recommended SP, CP% and Green/Yellow/Red verdict, newest first. It INNER JOINs
+-- pricing, so designs still slicing (no cost yet) and archived designs are excluded
+-- - a cost report only lists designs that actually have a cost.
+-- name: ListDesignCostReport :many
+SELECT d.id, d.brand_slug, d.name, d.sku, d.status,
+       p.design_cp::float8 AS design_cp, p.verdict,
+       p.cp_pct::float8 AS cp_pct, p.recommended_sp, d.updated_at
+FROM designs d
+JOIN design_pricing p ON p.design_id = d.id
+WHERE d.brand_slug = $1 AND d.status <> 'archived'
+ORDER BY d.created_at DESC, d.id DESC;
+
+-- ArchiveDesign soft-deletes a design: hidden from every view but "Archived", and
+-- restorable. No-op (0 rows) if it is already archived.
+-- name: ArchiveDesign :execrows
+UPDATE designs SET status = 'archived', updated_at = now()
+WHERE id = $1 AND status <> 'archived';
+
+-- UnarchiveDesign restores an archived design back into the pipeline as priced, so
+-- it can be reviewed and resubmitted. No-op (0 rows) if it is not archived.
+-- name: UnarchiveDesign :execrows
+UPDATE designs SET status = 'priced', updated_at = now()
+WHERE id = $1 AND status = 'archived';
+
+-- SetDesignPersonalisationRules stores (or clears, with NULL) the product's
+-- personalization rule set. The jsonb shape is validated in Go before it is set.
+-- name: SetDesignPersonalisationRules :one
+UPDATE designs SET personalisation_rules = sqlc.narg('personalisation_rules'), updated_at = now()
+WHERE id = sqlc.arg('id')
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, machine_id, personalisation_rules, created_at, updated_at;
 
 -- name: ListDesignsByBrand :many
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
        finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       preview_key, sku, created_at, updated_at
 FROM designs WHERE brand_slug = $1 ORDER BY created_at DESC;
 
 -- name: ListDesignsByBrandPage :many
@@ -33,9 +96,35 @@ FROM designs WHERE brand_slug = $1 ORDER BY created_at DESC;
 -- as a stable tiebreaker.
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
        finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       preview_key, sku, created_at, updated_at
 FROM designs
 WHERE brand_slug = sqlc.arg('brand_slug')
+  AND (
+    sqlc.narg('cursor_created_at')::timestamptz IS NULL
+    OR (created_at, id) < (sqlc.narg('cursor_created_at')::timestamptz, sqlc.narg('cursor_id')::uuid)
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg('page_limit');
+
+-- name: ListDesignsForBrands :many
+-- All designs across a set of brands (the caller's accessible brands), newest
+-- first. Powers the global "all brands" dashboard view.
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, created_at, updated_at
+FROM designs
+WHERE brand_slug = ANY(sqlc.arg('brand_slugs')::text[])
+ORDER BY created_at DESC, id DESC;
+
+-- name: ListDesignsForBrandsPage :many
+-- Keyset page of the global "all brands" view: rows across the given brands
+-- strictly before the (created_at, id) cursor, newest first. A null cursor
+-- returns the first page.
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, created_at, updated_at
+FROM designs
+WHERE brand_slug = ANY(sqlc.arg('brand_slugs')::text[])
   AND (
     sqlc.narg('cursor_created_at')::timestamptz IS NULL
     OR (created_at, id) < (sqlc.narg('cursor_created_at')::timestamptz, sqlc.narg('cursor_id')::uuid)
@@ -47,12 +136,61 @@ LIMIT sqlc.arg('page_limit');
 UPDATE designs SET status = sqlc.arg('status'), updated_at = now()
 WHERE id = sqlc.arg('id');
 
+-- name: SetDesignName :exec
+UPDATE designs SET name = sqlc.arg('name'), updated_at = now()
+WHERE id = sqlc.arg('id');
+
+-- name: SetDesignNotes :exec
+UPDATE designs SET notes = sqlc.narg('notes'), updated_at = now()
+WHERE id = sqlc.arg('id');
+
+-- name: SetDesignAttributes :exec
+UPDATE designs SET attributes = sqlc.narg('attributes'), updated_at = now()
+WHERE id = sqlc.arg('id');
+
+-- name: SetDesignPreviewKey :exec
+UPDATE designs SET preview_key = sqlc.arg('preview_key'), updated_at = now()
+WHERE id = sqlc.arg('id');
+
+-- name: InsertDesignReview :one
+INSERT INTO design_reviews (id, design_id, author_id, kind, body)
+VALUES (sqlc.arg('id'), sqlc.arg('design_id'), sqlc.arg('author_id'), sqlc.arg('kind'), sqlc.narg('body'))
+RETURNING *;
+
+-- name: ListDesignReviews :many
+SELECT * FROM design_reviews WHERE design_id = $1 ORDER BY created_at ASC, id ASC;
+
 -- name: UpdateDesignSpecs :exec
 UPDATE designs SET
     material = sqlc.arg('material'), colour = sqlc.narg('colour'),
     finish = sqlc.arg('finish'), units_per_bed = sqlc.arg('units_per_bed'),
     quality = sqlc.arg('quality'), infill_pct = sqlc.arg('infill_pct')::float8,
+    machine_id = sqlc.narg('machine_id'),
     status = sqlc.arg('status'), updated_at = now()
+WHERE id = sqlc.arg('id');
+
+-- SetDesignSku assigns (or clears) the catalog SKU. The partial unique index
+-- designs_sku_key rejects a duplicate assigned SKU with a 23505 the handler maps
+-- to a 409.
+-- name: SetDesignSku :one
+UPDATE designs SET sku = sqlc.narg('sku'), updated_at = now()
+WHERE id = sqlc.arg('id')
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, created_at, updated_at;
+
+-- GetDesignBySku resolves an order line's SKU to its design so a production job
+-- can be built straight from the catalog (STL + material + colour).
+-- name: GetDesignBySku :one
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, template_file_id, personalisation_rules, created_at, updated_at
+FROM designs WHERE sku = $1;
+
+-- SetDesignTemplateFile records the file_asset that stands in for the design's
+-- model in the production queue, so it is created once and reused for reprints.
+-- name: SetDesignTemplateFile :exec
+UPDATE designs SET template_file_id = sqlc.arg('template_file_id'), updated_at = now()
 WHERE id = sqlc.arg('id');
 
 -- name: GetLatestJobForDesign :one

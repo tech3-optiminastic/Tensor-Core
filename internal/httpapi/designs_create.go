@@ -1,13 +1,18 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -18,9 +23,25 @@ import (
 	"github.com/Optiminastic/tensor-core/internal/slicing"
 )
 
+// shopifyAttrKeys are the optional Shopify link + price-snapshot fields the import
+// flow attaches to a design's attributes jsonb, so the design detail can show a
+// cost-vs-listing-price comparison. Free-form strings; the frontend re-validates.
+var shopifyAttrKeys = []string{
+	"shopify_product_gid", "shopify_handle", "shopify_admin_url",
+	"shopify_min_price", "shopify_max_price", "shopify_currency",
+}
+
 // maxUploadBytes caps an STL upload. Real parts slice well under this; the cap
 // keeps a runaway file from filling storage.
 const maxUploadBytes = 60 << 20 // 60 MB
+
+// maxPreviewBytes caps the preview image. allowedImageExt is the set the designer
+// may upload as the design's cover.
+const maxPreviewBytes = 10 << 20 // 10 MB
+
+var allowedImageExt = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".gif": true,
+}
 
 // designForm is the validated multipart upload: the answers plus the model file.
 type designForm struct {
@@ -32,6 +53,15 @@ type designForm struct {
 	Colour      *string
 	UnitsPerBed int32
 	InfillPct   float64
+	Notes       *string
+	// Advanced slice overrides. Empty on upload; a re-slice can carry them.
+	Settings slicing.SliceSettings
+	// The machine to slice on (nil = legacy H2S 0.4) and, optionally, the exact
+	// machine filament to use.
+	MachineID      *uuid.UUID
+	FilamentPreset string
+	// Upload metadata (spec Step 1), stored as jsonb; nil when none supplied.
+	Attributes []byte
 }
 
 // pipelineReady fails closed with 503 when object storage or the slice enqueuer
@@ -62,6 +92,9 @@ func (s *Server) createDesign(c *gin.Context) {
 		detail(c, http.StatusNotFound, fmt.Sprintf("Brand '%s' is not configured yet.", form.Brand))
 		return
 	}
+	if !s.requireBrandAccess(c, form.Brand) {
+		return
+	}
 	ext, ok := validateModelFile(c, fileHeader)
 	if !ok {
 		return
@@ -73,14 +106,18 @@ func (s *Server) createDesign(c *gin.Context) {
 	if !s.uploadModel(c, stlKey, fileHeader) {
 		return
 	}
+	previewKey, ok := s.resolveAndStorePreview(c, designID)
+	if !ok {
+		return
+	}
 
-	row, ok := s.insertDesignAndJob(c, designID, stlKey, user.ID, form)
+	row, ok := s.insertDesignAndJob(c, designID, stlKey, previewKey, user.ID, form)
 	if !ok {
 		return
 	}
 	c.JSON(http.StatusCreated, designDTO(row.ID, row.BrandSlug, row.Name, row.CreatedBy, row.Status,
 		row.Material, row.Colour, row.Finish, row.UnitsPerBed, row.Quality, row.InfillPct,
-		row.CreatedAt, row.UpdatedAt))
+		row.PreviewKey, row.Sku, row.CreatedAt, row.UpdatedAt))
 }
 
 // parseDesignForm reads and validates every multipart field and the file header.
@@ -105,6 +142,13 @@ func (s *Server) parseDesignForm(c *gin.Context) (designForm, *multipart.FileHea
 	if colour := strings.TrimSpace(c.PostForm("colour")); colour != "" {
 		f.Colour = &colour
 	}
+	if notes := strings.TrimSpace(c.PostForm("notes")); notes != "" {
+		if len(notes) > 2000 {
+			detail(c, http.StatusUnprocessableEntity, "Notes must be 2000 characters or fewer.")
+			return f, nil, false
+		}
+		f.Notes = &notes
+	}
 	units, ok := parseUnits(c, c.PostForm("units_per_bed"))
 	if !ok {
 		return f, nil, false
@@ -116,12 +160,82 @@ func (s *Server) parseDesignForm(c *gin.Context) (designForm, *multipart.FileHea
 	}
 	f.InfillPct = infill
 
+	if mid := strings.TrimSpace(c.PostForm("machine_id")); mid != "" {
+		id, err := uuid.Parse(mid)
+		if err != nil {
+			detail(c, http.StatusUnprocessableEntity, "Invalid machine id.")
+			return f, nil, false
+		}
+		f.MachineID = &id
+	}
+	f.FilamentPreset = strings.TrimSpace(c.PostForm("filament_preset"))
+	f.Attributes = parseAttributes(c)
+
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
 		detail(c, http.StatusUnprocessableEntity, "An STL, 3MF or STEP file is required.")
 		return f, nil, false
 	}
 	return f, fileHeader, true
+}
+
+// parseAttributes reads the optional upload-metadata fields (spec Step 1) into a
+// jsonb blob, or nil when none were supplied. Free-form: the backend stores what
+// the designer entered; costing can read it later.
+func parseAttributes(c *gin.Context) []byte {
+	productType := strings.TrimSpace(c.PostForm("product_type"))
+	personalisationType := strings.TrimSpace(c.PostForm("personalisation_type"))
+	packagingType := strings.TrimSpace(c.PostForm("packaging_type"))
+	colourCount := 0
+	if v := strings.TrimSpace(c.PostForm("colour_count")); v != "" {
+		colourCount, _ = strconv.Atoi(v)
+	}
+	var addOns []string
+	for _, a := range strings.Split(c.PostForm("add_ons"), ",") {
+		if t := strings.TrimSpace(a); t != "" {
+			addOns = append(addOns, t)
+		}
+	}
+	// Colours auto-detected from a 3MF on upload (the full palette; the design's
+	// Colour field is a length-capped human label).
+	var detectedColours []string
+	for _, hexVal := range strings.Split(c.PostForm("detected_colours"), ",") {
+		if t := strings.TrimSpace(hexVal); t != "" {
+			detectedColours = append(detectedColours, t)
+		}
+	}
+
+	attrs := map[string]any{}
+	if productType != "" {
+		attrs["product_type"] = productType
+	}
+	if personalisationType != "" {
+		attrs["personalisation_type"] = personalisationType
+	}
+	if packagingType != "" {
+		attrs["packaging_type"] = packagingType
+	}
+	if colourCount > 0 {
+		attrs["colour_count"] = colourCount
+	}
+	if len(addOns) > 0 {
+		attrs["add_ons"] = addOns
+	}
+	if len(detectedColours) > 0 {
+		attrs["detected_colours"] = detectedColours
+	}
+	// Shopify import snapshot: the source product id + a price snapshot, so the
+	// design detail can compare true cost against the live listing price.
+	for _, key := range shopifyAttrKeys {
+		if v := strings.TrimSpace(c.PostForm(key)); v != "" {
+			attrs[key] = v
+		}
+	}
+	if len(attrs) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(attrs)
+	return b
 }
 
 // validateSpecValues checks the enum-like answers against the accepted sets.
@@ -177,6 +291,124 @@ func validateModelFile(c *gin.Context, fh *multipart.FileHeader) (string, bool) 
 	return ext, true
 }
 
+// resolveAndStorePreview stores the design's cover image and returns its storage
+// key. An uploaded "preview" file wins; failing that, a "preview_url" (the Shopify
+// import flow, pointing at the product's own photo) is fetched server-side. A
+// request with neither still 422s - a preview is always required.
+func (s *Server) resolveAndStorePreview(c *gin.Context, designID uuid.UUID) (string, bool) {
+	if fh, err := c.FormFile("preview"); err == nil {
+		ext := strings.ToLower(filepath.Ext(fh.Filename))
+		if !allowedImageExt[ext] {
+			detail(c, http.StatusUnprocessableEntity, "The preview must be a PNG, JPG, WEBP or GIF image.")
+			return "", false
+		}
+		if fh.Size <= 0 {
+			detail(c, http.StatusUnprocessableEntity, "The preview image is empty.")
+			return "", false
+		}
+		if fh.Size > maxPreviewBytes {
+			detail(c, http.StatusRequestEntityTooLarge, "The preview image is larger than the 10 MB limit.")
+			return "", false
+		}
+		key := fmt.Sprintf("designs/%s/preview%s", designID, ext)
+		if !s.uploadModel(c, key, fh) {
+			return "", false
+		}
+		return key, true
+	}
+
+	if rawURL := strings.TrimSpace(c.PostForm("preview_url")); rawURL != "" {
+		data, ext, err := fetchPreviewFromURL(c.Request.Context(), rawURL)
+		if err != nil {
+			detail(c, http.StatusUnprocessableEntity, err.Error())
+			return "", false
+		}
+		key := fmt.Sprintf("designs/%s/preview%s", designID, ext)
+		if !s.putPreviewBytes(c, key, data) {
+			return "", false
+		}
+		return key, true
+	}
+
+	detail(c, http.StatusUnprocessableEntity, "A preview image is required.")
+	return "", false
+}
+
+// putPreviewBytes stores fetched preview bytes at key.
+func (s *Server) putPreviewBytes(c *gin.Context, key string, data []byte) bool {
+	if err := s.storage.Put(c.Request.Context(), key, bytes.NewReader(data),
+		int64(len(data)), "application/octet-stream"); err != nil {
+		detail(c, http.StatusInternalServerError, "Could not store the preview image.")
+		return false
+	}
+	return true
+}
+
+// fetchPreviewFromURL downloads a Shopify product image to use as the design
+// cover. It is deliberately narrow to avoid SSRF: only https URLs on a Shopify
+// host (the URL only ever comes from our own catalog's image_url), an image
+// content-type, and a 10 MB cap.
+func fetchPreviewFromURL(ctx context.Context, rawURL string) ([]byte, string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !isShopifyImageHost(u.Hostname()) {
+		return nil, "", fmt.Errorf("the preview URL must be an https Shopify image URL")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("could not fetch the preview image")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("could not fetch the preview image")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("could not fetch the preview image (%d)", resp.StatusCode)
+	}
+	ext, ok := imageExtForContentType(resp.Header.Get("Content-Type"))
+	if !ok {
+		return nil, "", fmt.Errorf("the preview URL is not an image")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPreviewBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("could not read the preview image")
+	}
+	if len(data) == 0 {
+		return nil, "", fmt.Errorf("the preview image is empty")
+	}
+	if int64(len(data)) > maxPreviewBytes {
+		return nil, "", fmt.Errorf("the preview image is larger than the 10 MB limit")
+	}
+	return data, ext, nil
+}
+
+// isShopifyImageHost allows only Shopify-owned image hosts.
+func isShopifyImageHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "cdn.shopify.com" ||
+		strings.HasSuffix(host, ".shopify.com") ||
+		strings.HasSuffix(host, ".shopifycdn.com")
+}
+
+// imageExtForContentType maps an image content-type to a stored file extension.
+func imageExtForContentType(ct string) (string, bool) {
+	base := strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	switch base {
+	case "image/png":
+		return ".png", true
+	case "image/jpeg", "image/jpg":
+		return ".jpg", true
+	case "image/webp":
+		return ".webp", true
+	case "image/gif":
+		return ".gif", true
+	default:
+		return "", false
+	}
+}
+
 // uploadModel streams the upload straight to object storage.
 func (s *Server) uploadModel(c *gin.Context, key string, fh *multipart.FileHeader) bool {
 	f, err := fh.Open()
@@ -197,17 +429,26 @@ func (s *Server) uploadModel(c *gin.Context, key string, fh *multipart.FileHeade
 // same tx, a design can never be committed without its slice being queued (and a
 // rollback leaves neither), which removes the old post-commit dual-write bug.
 func (s *Server) insertDesignAndJob(
-	c *gin.Context, designID uuid.UUID, stlKey, createdBy string, form designForm,
+	c *gin.Context, designID uuid.UUID, stlKey, previewKey, createdBy string, form designForm,
 ) (gen.InsertDesignRow, bool) {
 	ctx := c.Request.Context()
 	var row gen.InsertDesignRow
 	jobID := uuid.New()
 	err := s.store.InTxWith(ctx, func(q *gen.Queries, tx pgx.Tx) error {
+		// Every design gets a permanent, system-generated SKU at creation - no one
+		// types one in. The sequence guarantees the numeric suffix is unique.
+		seq, err := q.NextDesignSkuSeq(ctx)
+		if err != nil {
+			return err
+		}
+		sku := generateSKU(form.Brand, form.Material, form.Colour, seq)
 		d, err := q.InsertDesign(ctx, gen.InsertDesignParams{
 			ID: designID, BrandSlug: form.Brand, Name: form.Name, CreatedBy: createdBy,
 			Status: designQueued, StlKey: stlKey, Material: form.Material, Colour: form.Colour,
+			Sku: &sku, MachineID: form.MachineID,
 			Finish: form.Finish, UnitsPerBed: form.UnitsPerBed, Quality: form.Quality,
-			InfillPct: form.InfillPct,
+			InfillPct: form.InfillPct, Notes: form.Notes, PreviewKey: previewKey,
+			Attributes: form.Attributes,
 		})
 		if err != nil {
 			return err
@@ -236,6 +477,7 @@ func (s *Server) enqueueSliceTx(
 		JobID: jobID, DesignID: designID, BrandSlug: form.Brand, StlKey: stlKey,
 		Material: form.Material, Quality: form.Quality,
 		UnitsPerBed: int(form.UnitsPerBed), InfillPct: form.InfillPct,
+		Settings: form.Settings, MachineID: form.MachineID, FilamentPreset: form.FilamentPreset,
 	})
 }
 
@@ -270,7 +512,7 @@ func (s *Server) resubmitDesign(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, designDTO(updated.ID, updated.BrandSlug, updated.Name, updated.CreatedBy,
 		updated.Status, updated.Material, updated.Colour, updated.Finish, updated.UnitsPerBed,
-		updated.Quality, updated.InfillPct, updated.CreatedAt, updated.UpdatedAt))
+		updated.Quality, updated.InfillPct, updated.PreviewKey, updated.Sku, updated.CreatedAt, updated.UpdatedAt))
 }
 
 type resubmitRequest struct {
@@ -280,6 +522,15 @@ type resubmitRequest struct {
 	Colour      *string `json:"colour"`
 	UnitsPerBed int     `json:"units_per_bed" binding:"required,min=1,max=100"`
 	InfillPct   float64 `json:"infill_pct" binding:"gte=0,lte=100"`
+	// Advanced slice overrides (all optional). Clamped/allowlisted server-side by
+	// SliceSettings.Normalize before they can reach the slicer CLI.
+	LayerHeightMM  *float64 `json:"layer_height_mm"`
+	WallLoops      *int     `json:"wall_loops"`
+	InfillPattern  *string  `json:"infill_pattern"`
+	Support        *bool    `json:"support"`
+	SupportDeg     *int     `json:"support_threshold_deg"`
+	MachineID      *string  `json:"machine_id"`
+	FilamentPreset *string  `json:"filament_preset"`
 }
 
 // parseResubmit binds the new answers (the STL is reused) and validates them.
@@ -297,11 +548,28 @@ func (s *Server) parseResubmit(c *gin.Context, brand string) (designForm, bool) 
 	form := designForm{
 		Brand: brand, Material: material, Finish: finish, Quality: quality,
 		UnitsPerBed: int32(req.UnitsPerBed), InfillPct: req.InfillPct,
+		Settings: slicing.SliceSettings{
+			LayerHeightMM: req.LayerHeightMM, WallLoops: req.WallLoops,
+			InfillPattern: req.InfillPattern, Support: req.Support, SupportDeg: req.SupportDeg,
+		}.Normalize(),
 	}
 	if req.Colour != nil {
 		if colour := strings.TrimSpace(*req.Colour); colour != "" {
 			form.Colour = &colour
 		}
+	}
+	if req.MachineID != nil {
+		if mid := strings.TrimSpace(*req.MachineID); mid != "" {
+			id, err := uuid.Parse(mid)
+			if err != nil {
+				detail(c, http.StatusUnprocessableEntity, "Invalid machine id.")
+				return designForm{}, false
+			}
+			form.MachineID = &id
+		}
+	}
+	if req.FilamentPreset != nil {
+		form.FilamentPreset = strings.TrimSpace(*req.FilamentPreset)
 	}
 	return form, true
 }
@@ -324,7 +592,7 @@ func (s *Server) applyResubmit(c *gin.Context, id uuid.UUID, stlKey string, form
 		if err := q.UpdateDesignSpecs(ctx, gen.UpdateDesignSpecsParams{
 			Material: form.Material, Colour: form.Colour, Finish: form.Finish,
 			UnitsPerBed: form.UnitsPerBed, Quality: form.Quality, InfillPct: form.InfillPct,
-			Status: designQueued, ID: id,
+			MachineID: form.MachineID, Status: designQueued, ID: id,
 		}); err != nil {
 			return err
 		}

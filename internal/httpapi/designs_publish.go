@@ -6,6 +6,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/Optiminastic/tensor-core/internal/db/gen"
 	"github.com/Optiminastic/tensor-core/internal/integrations/shopify"
 	"github.com/Optiminastic/tensor-core/internal/obs"
+	"github.com/Optiminastic/tensor-core/internal/orientation"
 )
 
 const (
@@ -41,7 +43,8 @@ type publishForm struct {
 	SEOTitle       string
 	SEODescription string
 	SKU            string
-	WeightGrams    float64
+	// Weight and dimensions are NOT here: they are physical facts Tensor derives
+	// from the slice (printed weight) and the model (bounding box), never typed.
 }
 
 type publishResponse struct {
@@ -55,12 +58,36 @@ type publishResponse struct {
 // product from it in one step. Approval is persisted first, so a missing/failed
 // Shopify connection leaves the design "approved" (retryable) rather than losing
 // the decision. Guarded by shopify:publish (PROJECT_LEAD / ADMIN).
+// resolvePublishSku persists a supplied SKU on the design and returns the SKU to
+// stamp on the Shopify variant. A blank form SKU falls back to the design's
+// stored SKU (so re-publishing keeps it). It writes the error response and
+// returns ok=false on an invalid or already-used SKU.
+func (s *Server) resolvePublishSku(c *gin.Context, id uuid.UUID, storedSku *string, formSku string) (string, bool) {
+	trimmed := strings.TrimSpace(formSku)
+	if trimmed == "" {
+		if storedSku != nil {
+			return *storedSku, true
+		}
+		return "", true
+	}
+	if !skuPattern.MatchString(trimmed) {
+		detail(c, http.StatusUnprocessableEntity,
+			"A SKU may contain letters, digits and - . _ / , up to 64 characters.")
+		return "", false
+	}
+	if _, err := s.store.Q.SetDesignSku(c.Request.Context(), gen.SetDesignSkuParams{ID: id, Sku: &trimmed}); err != nil {
+		if isUniqueViolation(err) {
+			detail(c, http.StatusConflict, "That SKU is already used by another design.")
+			return "", false
+		}
+		detail(c, http.StatusInternalServerError, "Could not save the SKU.")
+		return "", false
+	}
+	return trimmed, true
+}
+
 func (s *Server) publishDesignToShopify(c *gin.Context) {
 	id, ok := parseUUIDParam(c, "id")
-	if !ok {
-		return
-	}
-	form, images, ok := parsePublishForm(c)
 	if !ok {
 		return
 	}
@@ -71,8 +98,25 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 		dbError(c, err, "That design does not exist.", "Could not load the design.")
 		return
 	}
-	if design.Status != designPriced && design.Status != designApproved {
-		detail(c, http.StatusConflict, "Only a priced design can be approved and published.")
+	// Publishing is decoupled from approval: a design must be approved by the
+	// Project Lead (via POST /designs/:id/approve) before it can be pushed to
+	// Shopify. Re-publishing an already-published design is allowed (retry). The
+	// state is checked before the (multipart) form is parsed, to fail fast.
+	if design.Status != designApproved && design.Status != designPublished {
+		detail(c, http.StatusConflict, "Only an approved design can be published to Shopify.")
+		return
+	}
+
+	form, images, ok := parsePublishForm(c)
+	if !ok {
+		return
+	}
+
+	// Persist the SKU on the design - it is the catalog key an order resolves
+	// against, not just a Shopify attribute. A supplied SKU is saved (and becomes
+	// the variant SKU); when omitted, the design's stored SKU is reused.
+	skuToPublish, ok := s.resolvePublishSku(c, id, design.Sku, form.SKU)
+	if !ok {
 		return
 	}
 
@@ -81,7 +125,8 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 		detail(c, http.StatusInternalServerError, "Could not load the design's pricing.")
 		return
 	}
-	price, ok := resolvePrice(form.Price, pricing.RecommendedSp)
+	// The approved SP is the source of truth for the price; the form may override it.
+	price, ok := resolvePrice(form.Price, pricing.ApprovedSp)
 	if !ok {
 		detail(c, http.StatusUnprocessableEntity, "A selling price is required to publish.")
 		return
@@ -90,12 +135,6 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 	user, ok := auth.UserFrom(c)
 	if !ok {
 		detail(c, http.StatusUnauthorized, "Your session is not valid.")
-		return
-	}
-
-	// Record the approval up front; it must survive a Shopify failure.
-	if err := s.approve(ctx, id, price, user.ID); err != nil {
-		detail(c, http.StatusInternalServerError, "Could not approve the design.")
 		return
 	}
 
@@ -109,6 +148,16 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 	}
 
 	metrics, metricsErr := s.store.Q.GetLatestMetricsForDesign(ctx, id)
+	// Weight and dimensions come from Tensor, never from a typed field: the printed
+	// weight is the slice's filament grams, and the dimensions are the model's
+	// bounding box. Both are best-effort - a missing slice or unreadable model just
+	// omits them rather than blocking the publish.
+	weightGrams := 0.0
+	if metricsErr == nil {
+		weightGrams = metrics.FilamentG
+	}
+	metafields := buildMetafields(design, pricing, metrics, metricsErr == nil)
+	metafields = append(metafields, s.dimensionMetafields(ctx, design.StlKey)...)
 	draft := shopify.ProductDraft{
 		Title:           form.Title,
 		Vendor:          s.vendorFor(ctx, form.Vendor, design.BrandSlug),
@@ -118,9 +167,9 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 		DescriptionHTML: descriptionToHTML(form.Description),
 		SEOTitle:        form.SEOTitle,
 		SEODescription:  form.SEODescription,
-		SKU:             form.SKU,
-		WeightGrams:     form.WeightGrams,
-		Metafields:      buildMetafields(design, pricing, metrics, metricsErr == nil),
+		SKU:             skuToPublish,
+		WeightGrams:     weightGrams,
+		Metafields:      metafields,
 		Images:          images,
 	}
 
@@ -133,9 +182,9 @@ func (s *Server) publishDesignToShopify(c *gin.Context) {
 
 	// Set the price, SKU and weight on the (new or reused) variant. Idempotent, so
 	// a retry is safe.
-	if ref.VariantGID != "" && (price > 0 || form.SKU != "" || form.WeightGrams > 0) {
+	if ref.VariantGID != "" && (price > 0 || skuToPublish != "" || weightGrams > 0) {
 		if err := s.shopify.SetVariant(ctx, shop, token, ref.GID, ref.VariantGID, shopify.VariantDetails{
-			PriceINR: price, SKU: form.SKU, WeightGrams: form.WeightGrams,
+			PriceINR: price, SKU: skuToPublish, WeightGrams: weightGrams,
 		}); err != nil {
 			// Product exists and is recorded; the design stays "approved" and a
 			// retry will reuse it. Shopify-side failure.
@@ -200,15 +249,6 @@ func parsePublishForm(c *gin.Context) (publishForm, []shopify.ProductImage, bool
 		}
 		form.Price = &n
 	}
-	if raw := strings.TrimSpace(c.PostForm("weight_grams")); raw != "" {
-		w, err := strconv.ParseFloat(raw, 64)
-		if err != nil || w < 0 {
-			detail(c, http.StatusUnprocessableEntity, "Weight must be zero or a positive number.")
-			return publishForm{}, nil, false
-		}
-		form.WeightGrams = w
-	}
-
 	images, ok := readPublishImages(c)
 	if !ok {
 		return publishForm{}, nil, false
@@ -309,19 +349,6 @@ func shopifyCredentials(conn gen.GetConnectionWithTokenRow, err error) (shop, to
 	return *conn.ExternalAccountID, *conn.AccessToken, true
 }
 
-func (s *Server) approve(ctx context.Context, id uuid.UUID, price int, userID string) error {
-	approvedSp := int32(price)
-	approvedBy := userID
-	return s.store.InTx(ctx, func(q *gen.Queries) error {
-		if err := q.ApproveDesignPricing(ctx, gen.ApproveDesignPricingParams{
-			ApprovedSp: &approvedSp, ApprovedBy: &approvedBy, DesignID: id,
-		}); err != nil {
-			return err
-		}
-		return q.UpdateDesignStatus(ctx, gen.UpdateDesignStatusParams{Status: designApproved, ID: id})
-	})
-}
-
 // ensureShopifyProduct returns the design's Shopify draft product, creating it on
 // the first attempt or reusing the one a prior attempt recorded. The product is
 // recorded immediately after creation (before pricing), so a failure later in the
@@ -399,6 +426,37 @@ func (s *Server) vendorFor(ctx context.Context, requested, brandSlug string) str
 	return brandSlug
 }
 
+// dimensionMetafields loads the design's model and returns its bounding-box size
+// (mm) as "tensor" metafields, so the product's real dimensions come from Tensor
+// rather than being typed. Best-effort: no storage, a non-STL model, or any read
+// error returns nil so a publish never fails over dimensions.
+func (s *Server) dimensionMetafields(ctx context.Context, stlKey string) []shopify.Metafield {
+	if s.storage == nil || stlKey == "" || strings.ToLower(filepath.Ext(stlKey)) != ".stl" {
+		return nil
+	}
+	obj, err := s.storage.Get(ctx, stlKey)
+	if err != nil {
+		return nil
+	}
+	data, err := io.ReadAll(obj.Body)
+	_ = obj.Body.Close()
+	if err != nil {
+		return nil
+	}
+	mesh, err := orientation.LoadSTL(data)
+	if err != nil {
+		return nil
+	}
+	dim := func(key string, v float64) shopify.Metafield {
+		return shopify.Metafield{Namespace: "tensor", Key: key, Type: "number_decimal", Value: fmt.Sprintf("%.2f", v)}
+	}
+	return []shopify.Metafield{
+		dim("dim_x_mm", mesh.Max.X-mesh.Min.X),
+		dim("dim_y_mm", mesh.Max.Y-mesh.Min.Y),
+		dim("dim_z_mm", mesh.Max.Z-mesh.Min.Z),
+	}
+}
+
 // buildMetafields attaches the costing facts as "tensor" metafields so the
 // merchant sees them in Shopify. Metric-derived fields are omitted when metrics
 // are unavailable.
@@ -414,6 +472,14 @@ func buildMetafields(
 		mf = append(mf, shopify.Metafield{
 			Namespace: "tensor", Key: "recommended_sp", Type: "number_integer",
 			Value: fmt.Sprintf("%d", *pricing.RecommendedSp),
+		})
+	}
+	// The spec's required metafield set includes the approved selling price; the
+	// value is already loaded, it just was never published.
+	if pricing.ApprovedSp != nil {
+		mf = append(mf, shopify.Metafield{
+			Namespace: "tensor", Key: "approved_sp", Type: "number_integer",
+			Value: fmt.Sprintf("%d", *pricing.ApprovedSp),
 		})
 	}
 	if hasMetrics {

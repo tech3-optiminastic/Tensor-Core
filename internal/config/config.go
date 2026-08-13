@@ -54,12 +54,21 @@ type Settings struct {
 	DBConnectTimeout   time.Duration
 	DBStatementTimeout time.Duration
 
-	// Design pipeline: object storage for STL/G-code.
+	// Design pipeline: object storage for STL/G-code. The client is S3-compatible
+	// (MinIO in dev, AWS S3 in shared/prod deployments).
 	MinIOEndpoint  string
+	MinIORegion    string
 	MinIOAccessKey string
 	MinIOSecretKey string
 	MinIOBucket    string
-	MinIOSecure    bool
+	// MinIOPrefix partitions a shared bucket per project (e.g. "Tensor/"). Empty in
+	// dev, where MinIO owns the whole bucket. Object keys in the DB stay bare.
+	MinIOPrefix string
+	MinIOSecure bool
+	// MinIOAutoCreate ensures the bucket exists on startup. True for dev MinIO;
+	// must be false against a shared bucket whose IAM user is prefix-scoped and
+	// cannot HeadBucket/CreateBucket at the bucket root.
+	MinIOAutoCreate bool
 
 	// Slice worker (cmd/sliceworker): the Bambu Studio install, per-slice timeout,
 	// the calibratable average printer draw used to estimate energy, and how many
@@ -68,6 +77,11 @@ type Settings struct {
 	SliceTimeoutSeconds int
 	PrinterAvgPowerKW   float64
 	SliceConcurrency    int
+
+	// OpenSCADBin is the OpenSCAD executable used to render personalised text into
+	// printable geometry (the API's personalise-preview route). Absent/failed
+	// OpenSCAD just falls back to the plain model, so this is best-effort.
+	OpenSCADBin string
 
 	// Orientation analysis (advisory least-support recommendation): the
 	// self-support overhang limit in degrees, and a cap on mesh triangles scored
@@ -79,6 +93,32 @@ type Settings struct {
 	// per-request timeout for the outbound Admin API calls.
 	ShopifyAPIVersion string
 	ShopifyTimeout    time.Duration
+
+	// Shopify order import (inbound): the single app's OAuth credentials, this
+	// backend's own reachable URL (for the OAuth redirect + webhook callback), the
+	// frontend URL to bounce back to after connecting, and the key used to encrypt
+	// each store's access token at rest.
+	ShopifyClientID     string
+	ShopifyClientSecret string
+	PublicBaseURL       string
+	FrontendURL         string
+	TokenEncryptionKey  string
+
+	// AI optimization advisor via OpenRouter (an OpenAI-compatible LLM gateway).
+	// The key is required to run the advisor; absent, the endpoint fails closed
+	// (503). The model slug is configurable so the shop can pick any OpenRouter
+	// model (default a capable Claude).
+	OpenRouterAPIKey  string
+	OpenRouterModel   string
+	OpenRouterTimeout time.Duration
+
+	// SMTP for the email-report feature (net/smtp, STARTTLS on 587). Absent
+	// host/from means the email endpoint fails closed (503).
+	SMTPHost string
+	SMTPPort int
+	SMTPUser string
+	SMTPPass string
+	SMTPFrom string
 }
 
 // Load reads settings from the process environment. It never fails: missing
@@ -118,23 +158,63 @@ func Load() Settings {
 		DBConnectTimeout:   secondsEnvOr("DB_CONNECT_TIMEOUT_SECONDS", 10),
 		DBStatementTimeout: secondsEnvOr("DB_STATEMENT_TIMEOUT_SECONDS", 15),
 
-		MinIOEndpoint:  envOr("MINIO_ENDPOINT", "localhost:9100"),
-		MinIOAccessKey: envOr("MINIO_ACCESS_KEY", "tensor"),
-		MinIOSecretKey: envOr("MINIO_SECRET_KEY", "tensor_local_dev"),
-		MinIOBucket:    envOr("MINIO_BUCKET", "designs"),
-		MinIOSecure:    boolEnvOr("MINIO_SECURE", false),
+		MinIOEndpoint:   envOr("MINIO_ENDPOINT", "localhost:9100"),
+		MinIORegion:     os.Getenv("MINIO_REGION"),
+		MinIOAccessKey:  envOr("MINIO_ACCESS_KEY", "tensor"),
+		MinIOSecretKey:  envOr("MINIO_SECRET_KEY", "tensor_local_dev"),
+		MinIOBucket:     envOr("MINIO_BUCKET", "designs"),
+		MinIOPrefix:     os.Getenv("MINIO_PREFIX"),
+		MinIOSecure:     boolEnvOr("MINIO_SECURE", false),
+		MinIOAutoCreate: boolEnvOr("MINIO_AUTO_CREATE", true),
 
 		BambuRoot:           envOr("BAMBU_ROOT", "/opt/bambu/squashfs-root"),
 		SliceTimeoutSeconds: intEnvOr("SLICE_TIMEOUT_SECONDS", 300),
 		PrinterAvgPowerKW:   floatEnvOr("PRINTER_AVG_POWER_KW", 0.11),
 		SliceConcurrency:    intEnvOr("SLICE_CONCURRENCY", 2),
+		OpenSCADBin:         envOr("OPENSCAD_BIN", "openscad"),
 
 		OrientationOverhangDeg:  floatEnvOr("ORIENTATION_OVERHANG_DEG", 45),
 		OrientationMaxTriangles: intEnvOr("ORIENTATION_MAX_TRIANGLES", 500_000),
 
 		ShopifyAPIVersion: envOr("SHOPIFY_API_VERSION", "2024-10"),
 		ShopifyTimeout:    secondsEnvOr("SHOPIFY_TIMEOUT_SECONDS", 15),
+
+		ShopifyClientID:     os.Getenv("SHOPIFY_CLIENT_ID"),
+		ShopifyClientSecret: os.Getenv("SHOPIFY_CLIENT_SECRET"),
+		PublicBaseURL:       strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		FrontendURL:         strings.TrimRight(envOr("FRONTEND_URL", "http://localhost:3001"), "/"),
+		TokenEncryptionKey:  os.Getenv("TOKEN_ENCRYPTION_KEY"),
+
+		OpenRouterAPIKey:  os.Getenv("OPENROUTER_API_KEY"),
+		OpenRouterModel:   envOr("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5"),
+		OpenRouterTimeout: secondsEnvOr("OPENROUTER_TIMEOUT_SECONDS", 60),
+
+		SMTPHost: os.Getenv("SMTP_HOST"),
+		SMTPPort: intEnvOr("SMTP_PORT", 587),
+		SMTPUser: os.Getenv("SMTP_USER"),
+		SMTPPass: os.Getenv("SMTP_PASS"),
+		SMTPFrom: os.Getenv("SMTP_FROM"),
 	}
+}
+
+// EmailConfigured reports whether the email-report feature can send. When false,
+// the email endpoint fails closed with a 503.
+func (s Settings) EmailConfigured() bool {
+	return strings.TrimSpace(s.SMTPHost) != "" && strings.TrimSpace(s.SMTPFrom) != ""
+}
+
+// AdvisorConfigured reports whether the AI optimization advisor has an API key.
+// When false, the optimize endpoint fails closed with a 503.
+func (s Settings) AdvisorConfigured() bool {
+	return strings.TrimSpace(s.OpenRouterAPIKey) != ""
+}
+
+// ShopifyImportConfigured reports whether the inbound Shopify order-import flow
+// has everything it needs. When false, the integration endpoints fail closed with
+// a 503 rather than half-working.
+func (s Settings) ShopifyImportConfigured() bool {
+	return s.ShopifyClientID != "" && s.ShopifyClientSecret != "" &&
+		s.PublicBaseURL != "" && s.TokenEncryptionKey != ""
 }
 
 // IsProduction reports whether the service is running outside development, where

@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,6 +14,26 @@ import (
 	"github.com/Optiminastic/tensor-core/internal/db"
 	"github.com/Optiminastic/tensor-core/internal/db/gen"
 )
+
+// shopDomainPattern matches a Shopify store's canonical admin domain, e.g.
+// "your-store.myshopify.com". The publish/edit calls build the Admin API URL as
+// https://<domain>/admin/api/..., so anything that is not a myshopify.com domain
+// (a bare email, a storefront URL) silently sends requests to the wrong host and
+// fails later with an opaque 404. Validating here stops the bad value at the door.
+var shopDomainPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.myshopify\.com$`)
+
+// normalizeShopDomain lowercases and strips a pasted scheme/trailing slash, then
+// checks the result is a myshopify.com domain. Returns ok=false when it is not.
+func normalizeShopDomain(raw string) (string, bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimSuffix(s, "/")
+	if !shopDomainPattern.MatchString(s) {
+		return "", false
+	}
+	return s, true
+}
 
 // A brand can connect to these external ad and commerce platforms. The actual
 // OAuth dance runs in the frontend, which holds the provider app credentials;
@@ -58,6 +80,9 @@ func (s *Server) registerConnections(r *gin.Engine) {
 	g := r.Group("/brands/:slug/connections")
 	g.Use(s.guards.RequireUser())
 	g.GET("", s.guards.RequirePermission(auth.BrandRead.Key()), s.listConnections)
+	// Shopify one-click OAuth connect for this brand's store: returns the authorize
+	// URL the frontend redirects the browser to (the callback finishes the connect).
+	g.GET("/shopify/authorize", s.guards.RequirePermission(auth.BrandManage.Key()), s.shopifyBrandAuthorizeURL)
 	g.PUT("/:provider", s.guards.RequirePermission(auth.BrandManage.Key()), s.upsertConnection)
 	g.DELETE("/:provider", s.guards.RequirePermission(auth.BrandManage.Key()), s.deleteConnection)
 }
@@ -75,6 +100,11 @@ func providerParam(c *gin.Context) (string, bool) {
 func (s *Server) listConnections(c *gin.Context) {
 	slug, ok := brandSlugParam(c)
 	if !ok {
+		return
+	}
+	// A member may only read connections for a brand an admin assigned them, the
+	// same scoping as /brands/:slug and the designs routes (not just brand:read).
+	if !s.requireBrandAccess(c, slug) {
 		return
 	}
 	if !s.brandMustExist(c, slug) {
@@ -124,6 +154,19 @@ func (s *Server) upsertConnection(c *gin.Context) {
 	if _, ok := connectionStatuses[req.Status]; !ok {
 		detail(c, http.StatusUnprocessableEntity, "Status must be 'connected', 'disconnected', or 'error'.")
 		return
+	}
+
+	// A connected Shopify brand must carry a real *.myshopify.com store domain in
+	// external_account_id - the publish/edit calls turn it into the Admin API host.
+	// Reject (and normalize) anything else so a bad value can never be saved.
+	if provider == shopifyProvider && req.Status == "connected" {
+		domain, ok := normalizeShopDomain(deref(req.ExternalAccountID))
+		if !ok {
+			detail(c, http.StatusUnprocessableEntity,
+				"The Shopify store domain must look like your-store.myshopify.com.")
+			return
+		}
+		req.ExternalAccountID = &domain
 	}
 
 	user, _ := auth.UserFrom(c) // connected_by comes from the token, never the body.

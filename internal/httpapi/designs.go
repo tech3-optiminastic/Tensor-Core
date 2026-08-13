@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,17 +18,39 @@ import (
 	"github.com/Optiminastic/tensor-core/internal/auth"
 	"github.com/Optiminastic/tensor-core/internal/db"
 	"github.com/Optiminastic/tensor-core/internal/db/gen"
+	"github.com/Optiminastic/tensor-core/internal/failurerisk"
+	"github.com/Optiminastic/tensor-core/internal/slicing"
 	"github.com/Optiminastic/tensor-core/internal/storage"
 )
 
 // Design lifecycle statuses (the `designs.status` column).
 const (
-	designQueued    = "queued"
-	designSlicing   = "slicing"
-	designPriced    = "priced"
-	designFailed    = "failed"
-	designApproved  = "approved"
-	designPublished = "published"
+	designQueued           = "queued"
+	designSlicing          = "slicing"
+	designPriced           = "priced"
+	designFailed           = "failed"
+	designSubmitted        = "submitted"
+	designChangesRequested = "changes_requested"
+	designApproved         = "approved"
+	designPublished        = "published"
+	// Archived is a soft delete: the design is hidden from every list view except
+	// "Archived" and can be restored. It is not a pipeline stage.
+	designArchived = "archived"
+)
+
+// Review event kinds recorded on the design_reviews thread.
+const (
+	reviewComment = "comment"
+	reviewSubmit  = "submit"
+	reviewApprove = "approve"
+	reviewReject  = "reject"
+)
+
+// verdictGreen / verdictYellow are the submittable pre-check verdicts; a Red
+// design must be revised before it can go to the Project Lead.
+const (
+	verdictGreen  = "green"
+	verdictYellow = "yellow"
 )
 
 // Slice job statuses (the `slice_jobs.status` column).
@@ -58,6 +82,8 @@ type designResponse struct {
 	UnitsPerBed int       `json:"units_per_bed"`
 	Quality     string    `json:"quality"`
 	InfillPct   float64   `json:"infill_pct"`
+	SKU         *string   `json:"sku"`
+	HasPreview  bool      `json:"has_preview"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -112,23 +138,35 @@ type jobResponse struct {
 
 type designDetailResponse struct {
 	designResponse
-	Job     *jobResponse     `json:"job"`
-	Metrics *metricsResponse `json:"metrics"`
-	Pricing *pricingResponse `json:"pricing"`
-	Shopify *shopifyBlock    `json:"shopify"`
+	Notes                *string                `json:"notes"`
+	Job                  *jobResponse           `json:"job"`
+	Metrics              *metricsResponse       `json:"metrics"`
+	Pricing              *pricingResponse       `json:"pricing"`
+	Shopify              *shopifyBlock          `json:"shopify"`
+	Machine              *machineConfigResponse `json:"machine"`
+	PersonalisationRules json.RawMessage        `json:"personalisation_rules"`
+	// Upload metadata (product type, personalisation type, colour count, add-ons,
+	// packaging type); null when none was supplied.
+	Attributes json.RawMessage `json:"attributes"`
+	// The applied personalisation spec (name + placement + colour); null when the
+	// design has none, so the editor can rehydrate the saved state.
+	Personalisation json.RawMessage `json:"personalisation"`
+	// Advisory print-reliability score derived from the metrics; nil until sliced.
+	FailureRisk *failurerisk.Assessment `json:"failure_risk"`
 }
 
 // designDTO maps the shared design columns (identical across the insert/get/list
 // rows) to the wire shape. Wide-param like brandDTO, and for the same reason.
 func designDTO(
 	id uuid.UUID, brandSlug, name, createdBy, status, material string, colour *string,
-	finish string, unitsPerBed int32, quality string, infillPct float64,
-	created, updated pgtype.Timestamptz,
+	finish string, unitsPerBed int32, quality string, infillPct float64, previewKey string,
+	sku *string, created, updated pgtype.Timestamptz,
 ) designResponse {
 	return designResponse{
 		ID: id.String(), BrandSlug: brandSlug, Name: name, CreatedBy: createdBy, Status: status,
 		Material: material, Colour: colour, Finish: finish, UnitsPerBed: int(unitsPerBed),
-		Quality: quality, InfillPct: infillPct, CreatedAt: db.Time(created), UpdatedAt: db.Time(updated),
+		Quality: quality, InfillPct: infillPct, SKU: sku, HasPreview: previewKey != "",
+		CreatedAt: db.Time(created), UpdatedAt: db.Time(updated),
 	}
 }
 
@@ -137,19 +175,103 @@ func (s *Server) registerDesigns(r *gin.Engine) {
 	g.Use(s.guards.RequireUser())
 	g.GET("", s.guards.RequirePermission(auth.DesignRead.Key()), s.listDesigns)
 	g.POST("", s.guards.RequirePermission(auth.DesignCreate.Key()), s.createDesign)
-	g.GET("/:id", s.guards.RequirePermission(auth.DesignRead.Key()), s.getDesign)
-	g.GET("/:id/model", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadModel)
-	g.GET("/:id/gcode", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadGcode)
-	g.POST("/:id/resubmit", s.guards.RequirePermission(auth.DesignCreate.Key()), s.resubmitDesign)
-	g.POST("/:id/publish-shopify", s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.publishDesignToShopify)
+
+	// Every /:id route also passes the brand-access gate, so a member can only
+	// reach designs in a brand an admin assigned them (a 404 otherwise). Admins
+	// (brand:manage) pass through. The gate runs after RequireUser (inherited).
+	id := g.Group("/:id")
+	id.Use(s.requireDesignBrandAccess)
+	id.GET("", s.guards.RequirePermission(auth.DesignRead.Key()), s.getDesign)
+	id.DELETE("", s.guards.RequirePermission(auth.DesignDelete.Key()), s.deleteDesign)
+	// Archive is the soft-delete alternative to DELETE: reversible, and the design
+	// only shows under the "Archived" view. Same guard as delete.
+	id.PATCH("/archive", s.guards.RequirePermission(auth.DesignDelete.Key()), s.archiveDesign)
+	id.PATCH("/unarchive", s.guards.RequirePermission(auth.DesignDelete.Key()), s.unarchiveDesign)
+	// A multi-part product's parts (its recipe). Reading needs design:read; adding,
+	// editing and removing a part is a design edit (design:update / design:delete).
+	id.GET("/parts", s.guards.RequirePermission(auth.DesignRead.Key()), s.listDesignParts)
+	id.POST("/parts", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.createDesignPart)
+	id.PATCH("/parts/:partId", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.updateDesignPart)
+	id.DELETE("/parts/:partId", s.guards.RequirePermission(auth.DesignDelete.Key()), s.deleteDesignPart)
+	id.GET("/model", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadModel)
+	id.GET("/model-lite", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadModelLite)
+	id.GET("/personalise-preview", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadPersonalisePreview)
+	id.GET("/personalise-text", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadPersonaliseText)
+	id.PATCH("/personalisation", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.setDesignPersonalisation)
+	id.POST("/optimize", s.guards.RequirePermission(auth.DesignRead.Key()), s.optimizeDesign)
+	id.GET("/performance", s.guards.RequirePermission(auth.DesignRead.Key()), s.designPerformance)
+	id.GET("/report.pdf", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadDesignReport)
+	id.POST("/email-report", s.guards.RequirePermission(auth.DesignRead.Key()), s.emailDesignReport)
+	id.GET("/gcode", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadGcode)
+	id.GET("/gcode/plate", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadGcodePlate)
+	id.GET("/preview", s.guards.RequirePermission(auth.DesignRead.Key()), s.downloadPreview)
+	id.POST("/resubmit", s.guards.RequirePermission(auth.DesignCreate.Key()), s.resubmitDesign)
+	id.POST("/submit", s.guards.RequirePermission(auth.DesignSubmit.Key()), s.submitDesign)
+	id.POST("/approve", s.guards.RequirePermission(auth.DesignApprove.Key()), s.approveDesign)
+	id.POST("/reject", s.guards.RequirePermission(auth.DesignReject.Key()), s.rejectDesign)
+	id.POST("/comments", s.guards.RequirePermission(auth.DesignRead.Key()), s.commentOnDesign)
+	id.GET("/reviews", s.guards.RequirePermission(auth.DesignRead.Key()), s.listDesignReviews)
+	id.POST("/publish-shopify", s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.publishDesignToShopify)
+	// Edit an already-published Shopify listing: GET reads the live product to
+	// prefill the form, PATCH pushes the merchant-facing edits (and price/status).
+	id.GET("/shopify-product", s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.getShopifyProductState)
+	id.PATCH("/shopify-product", s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.editShopifyProduct)
+	id.PATCH("/sku", s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.setDesignSku)
+	id.PATCH("/name", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.renameDesign)
+	id.PATCH("/notes", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.setDesignNotes)
+	id.PATCH("/attributes", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.setDesignAttributes)
+	// The Marketing Head writes the product marketing copy (design:content only).
+	id.PATCH("/description", s.guards.RequirePermission(auth.DesignContent.Key()), s.setDesignDescription)
+	id.PATCH("/preview", s.guards.RequirePermission(auth.DesignUpdate.Key()), s.replaceDesignPreview)
+	id.PATCH("/personalisation-rules",
+		s.guards.RequirePermission(auth.ShopifyPublish.Key()), s.setDesignPersonalisationRules)
+	id.POST("/personalisation-estimate",
+		s.guards.RequirePermission(auth.DesignRead.Key()), s.estimatePersonalisation)
 }
 
-// listDesigns returns a brand's designs, newest first. The brand is a required
-// query parameter so the frontend lists per brand-scoped page.
+// requireDesignBrandAccess is the /:id gate: it resolves the design's brand and
+// denies (404, matching a missing design) when the caller may not access it. A
+// missing/invalid id or unknown design is left to the handler's own load, which
+// produces the same 404, so the gate only blocks the cross-brand case.
+func (s *Server) requireDesignBrandAccess(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.Next()
+		return
+	}
+	slug, err := s.store.Q.GetDesignBrandSlug(c.Request.Context(), id)
+	if err != nil {
+		c.Next()
+		return
+	}
+	user, ok := auth.UserFrom(c)
+	if !ok || !s.canAccessBrand(c.Request.Context(), user, slug) {
+		detail(c, http.StatusNotFound, "That design does not exist.")
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+// allBrandsSlug is the sentinel the frontend sends (or omits the brand entirely)
+// to request the global "all brands" view instead of a single brand's designs.
+const allBrandsSlug = "all"
+
+// listDesigns returns designs newest first. With a `brand` query parameter it
+// lists that one brand (the caller must have access); with the brand omitted or
+// set to the "all" sentinel it aggregates across every brand the caller can
+// access, for the global dashboard view.
 func (s *Server) listDesigns(c *gin.Context) {
 	slug := c.Query("brand")
+	if slug == "" || slug == allBrandsSlug {
+		s.listDesignsForAccessibleBrands(c)
+		return
+	}
 	if !slugPattern.MatchString(slug) {
 		detail(c, http.StatusUnprocessableEntity, "A valid 'brand' query parameter is required.")
+		return
+	}
+	if !s.requireBrandAccess(c, slug) {
 		return
 	}
 	ctx := c.Request.Context()
@@ -168,7 +290,7 @@ func (s *Server) listDesigns(c *gin.Context) {
 		out := make([]designResponse, 0, len(rows))
 		for _, r := range rows {
 			out = append(out, designDTO(r.ID, r.BrandSlug, r.Name, r.CreatedBy, r.Status, r.Material,
-				r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.CreatedAt, r.UpdatedAt))
+				r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.PreviewKey, r.Sku, r.CreatedAt, r.UpdatedAt))
 		}
 		c.JSON(http.StatusOK, out)
 		return
@@ -185,13 +307,97 @@ func (s *Server) listDesigns(c *gin.Context) {
 	out := make([]designResponse, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, designDTO(r.ID, r.BrandSlug, r.Name, r.CreatedBy, r.Status, r.Material,
-			r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.CreatedAt, r.UpdatedAt))
+			r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.PreviewKey, r.Sku, r.CreatedAt, r.UpdatedAt))
 	}
 	if n := len(rows); n > 0 {
 		last := rows[n-1]
 		setNextCursor(c, n, page.limit, last.CreatedAt.Time, last.ID)
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// accessibleBrandSlugs is the set of brand slugs the caller may read: every brand
+// for an admin (brand:manage), otherwise only their assigned brands. Mirrors the
+// admin/member split in listBrands so the global view never leaks another brand.
+func (s *Server) accessibleBrandSlugs(ctx context.Context, user auth.AuthenticatedUser) ([]string, error) {
+	if user.Has(auth.BrandManage.Key()) {
+		brands, err := s.store.Q.ListBrands(ctx)
+		if err != nil {
+			return nil, err
+		}
+		slugs := make([]string, len(brands))
+		for i, b := range brands {
+			slugs[i] = b.Slug
+		}
+		return slugs, nil
+	}
+	return s.store.Q.ListUserBrandSlugs(ctx, user.ID)
+}
+
+// listDesignsForAccessibleBrands powers the global "all brands" view: designs
+// across every brand the caller can access, newest first, same body shape and
+// keyset pagination as the per-brand list.
+func (s *Server) listDesignsForAccessibleBrands(c *gin.Context) {
+	ctx := c.Request.Context()
+	user, ok := auth.UserFrom(c)
+	if !ok {
+		detail(c, http.StatusUnauthorized, "Not authenticated.")
+		return
+	}
+	slugs, err := s.accessibleBrandSlugs(ctx, user)
+	if err != nil {
+		detail(c, http.StatusInternalServerError, "Could not resolve brand access.")
+		return
+	}
+	page, ok := parsePageParams(c)
+	if !ok {
+		return
+	}
+	if len(slugs) == 0 {
+		c.JSON(http.StatusOK, []designResponse{})
+		return
+	}
+	if !page.paginate {
+		rows, err := s.store.Q.ListDesignsForBrands(ctx, slugs)
+		if err != nil {
+			detail(c, http.StatusInternalServerError, "Could not list designs.")
+			return
+		}
+		c.JSON(http.StatusOK, designsFromForBrands(rows))
+		return
+	}
+	rows, err := s.store.Q.ListDesignsForBrandsPage(ctx, gen.ListDesignsForBrandsPageParams{
+		BrandSlugs: slugs, CursorCreatedAt: page.cursorTS, CursorID: page.cursorID, PageLimit: page.limit,
+	})
+	if err != nil {
+		detail(c, http.StatusInternalServerError, "Could not list designs.")
+		return
+	}
+	if n := len(rows); n > 0 {
+		last := rows[n-1]
+		setNextCursor(c, n, page.limit, last.CreatedAt.Time, last.ID)
+	}
+	c.JSON(http.StatusOK, designsFromForBrandsPage(rows))
+}
+
+// designsFromForBrands maps the full cross-brand rows to the API response shape.
+func designsFromForBrands(rows []gen.ListDesignsForBrandsRow) []designResponse {
+	out := make([]designResponse, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, designDTO(r.ID, r.BrandSlug, r.Name, r.CreatedBy, r.Status, r.Material,
+			r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.PreviewKey, r.Sku, r.CreatedAt, r.UpdatedAt))
+	}
+	return out
+}
+
+// designsFromForBrandsPage maps one keyset page of cross-brand rows.
+func designsFromForBrandsPage(rows []gen.ListDesignsForBrandsPageRow) []designResponse {
+	out := make([]designResponse, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, designDTO(r.ID, r.BrandSlug, r.Name, r.CreatedBy, r.Status, r.Material,
+			r.Colour, r.Finish, r.UnitsPerBed, r.Quality, r.InfillPct, r.PreviewKey, r.Sku, r.CreatedAt, r.UpdatedAt))
+	}
+	return out
 }
 
 // getDesign returns a design with its latest job, metrics and pricing so the
@@ -232,16 +438,137 @@ func (s *Server) getDesign(c *gin.Context) {
 		dbError(c, err, "That design does not exist.", "Could not load the design.")
 		return
 	}
+	machine, err := s.designMachine(ctx, d.MachineID)
+	if err != nil {
+		dbError(c, err, "That design does not exist.", "Could not load the design.")
+		return
+	}
 
 	resp := designDetailResponse{
 		designResponse: designDTO(d.ID, d.BrandSlug, d.Name, d.CreatedBy, d.Status, d.Material,
-			d.Colour, d.Finish, d.UnitsPerBed, d.Quality, d.InfillPct, d.CreatedAt, d.UpdatedAt),
-		Job:     job,
-		Metrics: metrics,
-		Pricing: pricing,
-		Shopify: shopifyBlk,
+			d.Colour, d.Finish, d.UnitsPerBed, d.Quality, d.InfillPct, d.PreviewKey, d.Sku, d.CreatedAt, d.UpdatedAt),
+		Notes:                d.Notes,
+		Job:                  job,
+		Metrics:              metrics,
+		Pricing:              pricing,
+		Shopify:              shopifyBlk,
+		Machine:              machine,
+		PersonalisationRules: json.RawMessage(d.PersonalisationRules),
+		Attributes:           json.RawMessage(d.Attributes),
+		Personalisation:      json.RawMessage(d.Personalisation),
+		FailureRisk:          failureRiskFor(metrics),
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// deleteDesign permanently removes a design and all its child rows (the FKs
+// cascade). Guarded by design:delete and the /:id brand-access gate. Stored model
+// / preview / g-code objects are left in object storage (harmless orphans); the
+// catalog record is what the UI and pipeline key off. Does not touch Shopify.
+func (s *Server) deleteDesign(c *gin.Context) {
+	id, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return
+	}
+	rows, err := s.store.Q.DeleteDesign(c.Request.Context(), id)
+	if err != nil {
+		detail(c, http.StatusInternalServerError, "Could not delete the design.")
+		return
+	}
+	if rows == 0 {
+		detail(c, http.StatusNotFound, "That design does not exist.")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// archiveDesign soft-deletes a design (status -> archived): it drops out of every
+// list view except "Archived" and can be restored. Guarded by design:delete and
+// the /:id brand-access gate. Idempotent - archiving an archived design is a 404.
+func (s *Server) archiveDesign(c *gin.Context) {
+	id, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return
+	}
+	rows, err := s.store.Q.ArchiveDesign(c.Request.Context(), id)
+	if err != nil {
+		detail(c, http.StatusInternalServerError, "Could not archive the design.")
+		return
+	}
+	if rows == 0 {
+		detail(c, http.StatusNotFound, "That design does not exist or is already archived.")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// unarchiveDesign restores an archived design back into the pipeline as priced.
+func (s *Server) unarchiveDesign(c *gin.Context) {
+	id, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return
+	}
+	rows, err := s.store.Q.UnarchiveDesign(c.Request.Context(), id)
+	if err != nil {
+		detail(c, http.StatusInternalServerError, "Could not restore the design.")
+		return
+	}
+	if rows == 0 {
+		detail(c, http.StatusNotFound, "That design does not exist or is not archived.")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// failureRiskFor scores print reliability from the latest metrics (nil when the
+// design has not been sliced). The overhang signal comes from the stored
+// orientation recommendation.
+func failureRiskFor(m *metricsResponse) *failurerisk.Assessment {
+	if m == nil {
+		return nil
+	}
+	a := failurerisk.Assess(failurerisk.Inputs{
+		FilamentG:           m.FilamentG,
+		SupportG:            m.SupportG,
+		SupportUsed:         m.SupportUsed,
+		WallLoops:           m.WallLoops,
+		PurgeG:              m.PurgeG,
+		ColourChanges:       m.ColourChanges,
+		OverhangBaselineMM2: overhangBaseline(m.Orientation),
+	})
+	return &a
+}
+
+// overhangBaseline pulls the baseline overhang area from the orientation
+// recommendation JSON, or 0 when absent.
+func overhangBaseline(raw json.RawMessage) float64 {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0
+	}
+	var o struct {
+		OverhangBaseline float64 `json:"overhang_area_baseline"`
+	}
+	_ = json.Unmarshal(raw, &o)
+	return o.OverhangBaseline
+}
+
+// designMachine resolves the machine profile a design slices on, or nil when the
+// design has no machine set (it uses the built-in default) or the chosen machine
+// has since been deleted.
+func (s *Server) designMachine(ctx context.Context, machineID *uuid.UUID) (*machineConfigResponse, error) {
+	if machineID == nil {
+		return nil, nil
+	}
+	m, err := s.store.Q.GetMachineConfig(ctx, *machineID)
+	if err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	dto := machineConfigDTO(m.ID, m.Name, m.Family, m.NozzleMm, m.Flow, m.DefaultColour,
+		m.LayerHeightMinMm, m.LayerHeightMaxMm, m.SupportedFilaments, m.Status, m.IsActive, m.IsDefault)
+	return &dto, nil
 }
 
 // downloadModel streams the original model a designer uploaded (STL/3MF/STEP).
@@ -285,6 +612,65 @@ func (s *Server) downloadGcode(c *gin.Context) {
 	s.streamObject(c, m.GcodeKey, safeName(d.Name)+".gcode.3mf")
 }
 
+// downloadGcodePlate streams the plate G-code as plain text, extracted from the
+// sliced Bambu 3MF project. The browser's layer preview renders from this, so it
+// does not have to unzip the archive itself.
+func (s *Server) downloadGcodePlate(c *gin.Context) {
+	d, ok := s.designForDownload(c)
+	if !ok {
+		return
+	}
+	m, err := s.store.Q.GetLatestMetricsForDesign(c.Request.Context(), d.ID)
+	if err != nil {
+		if isNoRows(err) {
+			detail(c, http.StatusNotFound, "No G-code is available for this design yet.")
+			return
+		}
+		detail(c, http.StatusInternalServerError, "Could not load the design's G-code.")
+		return
+	}
+	if m.GcodeKey == "" {
+		detail(c, http.StatusNotFound, "No G-code is available for this design yet.")
+		return
+	}
+
+	plate, err := s.extractPlateGcode(c.Request.Context(), m.GcodeKey)
+	if err != nil {
+		if storage.IsNotFound(err) {
+			detail(c, http.StatusNotFound, "That G-code is no longer available.")
+			return
+		}
+		detail(c, http.StatusInternalServerError, "Could not read the G-code.")
+		return
+	}
+	if plate == "" {
+		detail(c, http.StatusNotFound, "This slice has no plate G-code.")
+		return
+	}
+
+	c.Header("Content-Disposition", "inline")
+	c.Header("Cache-Control", "private, max-age=300")
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(plate))
+}
+
+// extractPlateGcode downloads the sliced .3mf for key to a temp file and returns
+// its plate G-code text, reusing the worker's archive reader. The temp file is
+// always removed before returning.
+func (s *Server) extractPlateGcode(ctx context.Context, key string) (string, error) {
+	tmp, err := os.CreateTemp("", "plate-*.gcode.3mf")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := s.storage.Download(ctx, key, tmpPath); err != nil {
+		return "", err
+	}
+	return slicing.LoadPlateGcode(tmpPath)
+}
+
 // designForDownload runs the shared pre-flight for the file downloads: pipeline
 // readiness, id parsing, and loading the design. It writes the error response
 // and returns ok=false when the caller should stop.
@@ -322,6 +708,44 @@ func (s *Server) streamObject(c *gin.Context, key, filename string) {
 	disposition := fmt.Sprintf("attachment; filename=%q", filename)
 	c.DataFromReader(http.StatusOK, obj.Size, "application/octet-stream", obj.Body,
 		map[string]string{"Content-Disposition": disposition})
+}
+
+// downloadPreview streams a design's cover image inline (so an <img> renders it),
+// unlike the model/gcode attachment downloads.
+func (s *Server) downloadPreview(c *gin.Context) {
+	d, ok := s.designForDownload(c)
+	if !ok {
+		return
+	}
+	if d.PreviewKey == "" {
+		detail(c, http.StatusNotFound, "This design has no preview image.")
+		return
+	}
+	s.streamInline(c, d.PreviewKey)
+}
+
+// streamInline serves an object inline with a content type inferred from its key,
+// for images shown in the browser rather than downloaded.
+func (s *Server) streamInline(c *gin.Context, key string) {
+	obj, err := s.storage.Get(c.Request.Context(), key)
+	if err != nil {
+		if storage.IsNotFound(err) {
+			detail(c, http.StatusNotFound, "That image is no longer available.")
+			return
+		}
+		detail(c, http.StatusInternalServerError, "Could not read the image.")
+		return
+	}
+	defer func() { _ = obj.Body.Close() }()
+
+	ctype := mime.TypeByExtension(filepath.Ext(key))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	c.DataFromReader(http.StatusOK, obj.Size, ctype, obj.Body, map[string]string{
+		"Content-Disposition": "inline",
+		"Cache-Control":       "private, max-age=300",
+	})
 }
 
 // safeName reduces a design name to filename-safe ASCII for downloads.

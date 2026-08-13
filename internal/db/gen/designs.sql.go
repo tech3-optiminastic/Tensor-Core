@@ -32,28 +32,79 @@ func (q *Queries) ApproveDesignPricing(ctx context.Context, arg ApproveDesignPri
 	return err
 }
 
+const archiveDesign = `-- name: ArchiveDesign :execrows
+UPDATE designs SET status = 'archived', updated_at = now()
+WHERE id = $1 AND status <> 'archived'
+`
+
+// ArchiveDesign soft-deletes a design: hidden from every view but "Archived", and
+// restorable. No-op (0 rows) if it is already archived.
+func (q *Queries) ArchiveDesign(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, archiveDesign, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteDesign = `-- name: DeleteDesign :execrows
+DELETE FROM designs WHERE id = $1
+`
+
+// DeleteDesign removes a design; every child row (jobs, metrics, pricing, reviews,
+// optimisations, attributes) is ON DELETE CASCADE, so this one statement is enough.
+func (q *Queries) DeleteDesign(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteDesign, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getDesignBrandSlug = `-- name: GetDesignBrandSlug :one
+SELECT brand_slug FROM designs WHERE id = $1
+`
+
+// GetDesignBrandSlug returns only a design's brand, for the cheap per-request
+// brand-access gate on the /:id sub-routes (no need to load the whole row).
+func (q *Queries) GetDesignBrandSlug(ctx context.Context, id uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getDesignBrandSlug, id)
+	var brand_slug string
+	err := row.Scan(&brand_slug)
+	return brand_slug, err
+}
+
 const getDesignByID = `-- name: GetDesignByID :one
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
-       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+       preview_key, sku, machine_id, personalisation_rules, attributes,
+       personalisation, personalised_stl_key, created_at, updated_at
 FROM designs WHERE id = $1
 `
 
 type GetDesignByIDRow struct {
-	ID          uuid.UUID
-	BrandSlug   string
-	Name        string
-	CreatedBy   string
-	Status      string
-	StlKey      string
-	Material    string
-	Colour      *string
-	Finish      string
-	UnitsPerBed int32
-	Quality     string
-	InfillPct   float64
-	CreatedAt   pgtype.Timestamptz
-	UpdatedAt   pgtype.Timestamptz
+	ID                   uuid.UUID
+	BrandSlug            string
+	Name                 string
+	CreatedBy            string
+	Status               string
+	StlKey               string
+	Material             string
+	Colour               *string
+	Finish               string
+	UnitsPerBed          int32
+	Quality              string
+	InfillPct            float64
+	Notes                *string
+	PreviewKey           string
+	Sku                  *string
+	MachineID            *uuid.UUID
+	PersonalisationRules []byte
+	Attributes           []byte
+	Personalisation      []byte
+	PersonalisedStlKey   *string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
 }
 
 func (q *Queries) GetDesignByID(ctx context.Context, id uuid.UUID) (GetDesignByIDRow, error) {
@@ -72,6 +123,70 @@ func (q *Queries) GetDesignByID(ctx context.Context, id uuid.UUID) (GetDesignByI
 		&i.UnitsPerBed,
 		&i.Quality,
 		&i.InfillPct,
+		&i.Notes,
+		&i.PreviewKey,
+		&i.Sku,
+		&i.MachineID,
+		&i.PersonalisationRules,
+		&i.Attributes,
+		&i.Personalisation,
+		&i.PersonalisedStlKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getDesignBySku = `-- name: GetDesignBySku :one
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, template_file_id, personalisation_rules, created_at, updated_at
+FROM designs WHERE sku = $1
+`
+
+type GetDesignBySkuRow struct {
+	ID                   uuid.UUID
+	BrandSlug            string
+	Name                 string
+	CreatedBy            string
+	Status               string
+	StlKey               string
+	Material             string
+	Colour               *string
+	Finish               string
+	UnitsPerBed          int32
+	Quality              string
+	InfillPct            float64
+	PreviewKey           string
+	Sku                  *string
+	TemplateFileID       *uuid.UUID
+	PersonalisationRules []byte
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+// GetDesignBySku resolves an order line's SKU to its design so a production job
+// can be built straight from the catalog (STL + material + colour).
+func (q *Queries) GetDesignBySku(ctx context.Context, sku *string) (GetDesignBySkuRow, error) {
+	row := q.db.QueryRow(ctx, getDesignBySku, sku)
+	var i GetDesignBySkuRow
+	err := row.Scan(
+		&i.ID,
+		&i.BrandSlug,
+		&i.Name,
+		&i.CreatedBy,
+		&i.Status,
+		&i.StlKey,
+		&i.Material,
+		&i.Colour,
+		&i.Finish,
+		&i.UnitsPerBed,
+		&i.Quality,
+		&i.InfillPct,
+		&i.PreviewKey,
+		&i.Sku,
+		&i.TemplateFileID,
+		&i.PersonalisationRules,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -265,16 +380,17 @@ const insertDesign = `-- name: InsertDesign :one
 
 INSERT INTO designs (
     id, brand_slug, name, created_by, status, stl_key,
-    material, colour, finish, units_per_bed, quality, infill_pct
+    material, colour, finish, units_per_bed, quality, infill_pct, notes, preview_key, sku, machine_id, attributes
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7, $8,
     $9, $10, $11,
-    $12::float8
+    $12::float8, $13, $14, $15,
+    $16, $17
 )
 RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
-          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-          created_at, updated_at
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, created_at, updated_at
 `
 
 type InsertDesignParams struct {
@@ -290,6 +406,11 @@ type InsertDesignParams struct {
 	UnitsPerBed int32
 	Quality     string
 	InfillPct   float64
+	Notes       *string
+	PreviewKey  string
+	Sku         *string
+	MachineID   *uuid.UUID
+	Attributes  []byte
 }
 
 type InsertDesignRow struct {
@@ -305,6 +426,9 @@ type InsertDesignRow struct {
 	UnitsPerBed int32
 	Quality     string
 	InfillPct   float64
+	Notes       *string
+	PreviewKey  string
+	Sku         *string
 	CreatedAt   pgtype.Timestamptz
 	UpdatedAt   pgtype.Timestamptz
 }
@@ -325,6 +449,11 @@ func (q *Queries) InsertDesign(ctx context.Context, arg InsertDesignParams) (Ins
 		arg.UnitsPerBed,
 		arg.Quality,
 		arg.InfillPct,
+		arg.Notes,
+		arg.PreviewKey,
+		arg.Sku,
+		arg.MachineID,
+		arg.Attributes,
 	)
 	var i InsertDesignRow
 	err := row.Scan(
@@ -340,8 +469,45 @@ func (q *Queries) InsertDesign(ctx context.Context, arg InsertDesignParams) (Ins
 		&i.UnitsPerBed,
 		&i.Quality,
 		&i.InfillPct,
+		&i.Notes,
+		&i.PreviewKey,
+		&i.Sku,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const insertDesignReview = `-- name: InsertDesignReview :one
+INSERT INTO design_reviews (id, design_id, author_id, kind, body)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, design_id, author_id, kind, body, created_at
+`
+
+type InsertDesignReviewParams struct {
+	ID       uuid.UUID
+	DesignID uuid.UUID
+	AuthorID string
+	Kind     string
+	Body     *string
+}
+
+func (q *Queries) InsertDesignReview(ctx context.Context, arg InsertDesignReviewParams) (DesignReview, error) {
+	row := q.db.QueryRow(ctx, insertDesignReview,
+		arg.ID,
+		arg.DesignID,
+		arg.AuthorID,
+		arg.Kind,
+		arg.Body,
+	)
+	var i DesignReview
+	err := row.Scan(
+		&i.ID,
+		&i.DesignID,
+		&i.AuthorID,
+		&i.Kind,
+		&i.Body,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -436,10 +602,99 @@ func (q *Queries) InsertSliceMetrics(ctx context.Context, arg InsertSliceMetrics
 	return err
 }
 
+const listDesignCostReport = `-- name: ListDesignCostReport :many
+SELECT d.id, d.brand_slug, d.name, d.sku, d.status,
+       p.design_cp::float8 AS design_cp, p.verdict,
+       p.cp_pct::float8 AS cp_pct, p.recommended_sp, d.updated_at
+FROM designs d
+JOIN design_pricing p ON p.design_id = d.id
+WHERE d.brand_slug = $1 AND d.status <> 'archived'
+ORDER BY d.created_at DESC, d.id DESC
+`
+
+type ListDesignCostReportRow struct {
+	ID            uuid.UUID
+	BrandSlug     string
+	Name          string
+	Sku           *string
+	Status        string
+	DesignCp      float64
+	Verdict       string
+	CpPct         float64
+	RecommendedSp *int32
+	UpdatedAt     pgtype.Timestamptz
+}
+
+// ListDesignCostReport lists a brand's priced designs with their Design CP,
+// recommended SP, CP% and Green/Yellow/Red verdict, newest first. It INNER JOINs
+// pricing, so designs still slicing (no cost yet) and archived designs are excluded
+// - a cost report only lists designs that actually have a cost.
+func (q *Queries) ListDesignCostReport(ctx context.Context, brandSlug string) ([]ListDesignCostReportRow, error) {
+	rows, err := q.db.Query(ctx, listDesignCostReport, brandSlug)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDesignCostReportRow{}
+	for rows.Next() {
+		var i ListDesignCostReportRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.BrandSlug,
+			&i.Name,
+			&i.Sku,
+			&i.Status,
+			&i.DesignCp,
+			&i.Verdict,
+			&i.CpPct,
+			&i.RecommendedSp,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDesignReviews = `-- name: ListDesignReviews :many
+SELECT id, design_id, author_id, kind, body, created_at FROM design_reviews WHERE design_id = $1 ORDER BY created_at ASC, id ASC
+`
+
+func (q *Queries) ListDesignReviews(ctx context.Context, designID uuid.UUID) ([]DesignReview, error) {
+	rows, err := q.db.Query(ctx, listDesignReviews, designID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []DesignReview{}
+	for rows.Next() {
+		var i DesignReview
+		if err := rows.Scan(
+			&i.ID,
+			&i.DesignID,
+			&i.AuthorID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDesignsByBrand = `-- name: ListDesignsByBrand :many
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
        finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       preview_key, sku, created_at, updated_at
 FROM designs WHERE brand_slug = $1 ORDER BY created_at DESC
 `
 
@@ -456,6 +711,8 @@ type ListDesignsByBrandRow struct {
 	UnitsPerBed int32
 	Quality     string
 	InfillPct   float64
+	PreviewKey  string
+	Sku         *string
 	CreatedAt   pgtype.Timestamptz
 	UpdatedAt   pgtype.Timestamptz
 }
@@ -482,6 +739,8 @@ func (q *Queries) ListDesignsByBrand(ctx context.Context, brandSlug string) ([]L
 			&i.UnitsPerBed,
 			&i.Quality,
 			&i.InfillPct,
+			&i.PreviewKey,
+			&i.Sku,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -498,7 +757,7 @@ func (q *Queries) ListDesignsByBrand(ctx context.Context, brandSlug string) ([]L
 const listDesignsByBrandPage = `-- name: ListDesignsByBrandPage :many
 SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
        finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
-       created_at, updated_at
+       preview_key, sku, created_at, updated_at
 FROM designs
 WHERE brand_slug = $1
   AND (
@@ -529,6 +788,8 @@ type ListDesignsByBrandPageRow struct {
 	UnitsPerBed int32
 	Quality     string
 	InfillPct   float64
+	PreviewKey  string
+	Sku         *string
 	CreatedAt   pgtype.Timestamptz
 	UpdatedAt   pgtype.Timestamptz
 }
@@ -563,6 +824,160 @@ func (q *Queries) ListDesignsByBrandPage(ctx context.Context, arg ListDesignsByB
 			&i.UnitsPerBed,
 			&i.Quality,
 			&i.InfillPct,
+			&i.PreviewKey,
+			&i.Sku,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDesignsForBrands = `-- name: ListDesignsForBrands :many
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, created_at, updated_at
+FROM designs
+WHERE brand_slug = ANY($1::text[])
+ORDER BY created_at DESC, id DESC
+`
+
+type ListDesignsForBrandsRow struct {
+	ID          uuid.UUID
+	BrandSlug   string
+	Name        string
+	CreatedBy   string
+	Status      string
+	StlKey      string
+	Material    string
+	Colour      *string
+	Finish      string
+	UnitsPerBed int32
+	Quality     string
+	InfillPct   float64
+	PreviewKey  string
+	Sku         *string
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+// All designs across a set of brands (the caller's accessible brands), newest
+// first. Powers the global "all brands" dashboard view.
+func (q *Queries) ListDesignsForBrands(ctx context.Context, brandSlugs []string) ([]ListDesignsForBrandsRow, error) {
+	rows, err := q.db.Query(ctx, listDesignsForBrands, brandSlugs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDesignsForBrandsRow{}
+	for rows.Next() {
+		var i ListDesignsForBrandsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.BrandSlug,
+			&i.Name,
+			&i.CreatedBy,
+			&i.Status,
+			&i.StlKey,
+			&i.Material,
+			&i.Colour,
+			&i.Finish,
+			&i.UnitsPerBed,
+			&i.Quality,
+			&i.InfillPct,
+			&i.PreviewKey,
+			&i.Sku,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDesignsForBrandsPage = `-- name: ListDesignsForBrandsPage :many
+SELECT id, brand_slug, name, created_by, status, stl_key, material, colour,
+       finish, units_per_bed, quality, infill_pct::float8 AS infill_pct,
+       preview_key, sku, created_at, updated_at
+FROM designs
+WHERE brand_slug = ANY($1::text[])
+  AND (
+    $2::timestamptz IS NULL
+    OR (created_at, id) < ($2::timestamptz, $3::uuid)
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT $4
+`
+
+type ListDesignsForBrandsPageParams struct {
+	BrandSlugs      []string
+	CursorCreatedAt pgtype.Timestamptz
+	CursorID        *uuid.UUID
+	PageLimit       int32
+}
+
+type ListDesignsForBrandsPageRow struct {
+	ID          uuid.UUID
+	BrandSlug   string
+	Name        string
+	CreatedBy   string
+	Status      string
+	StlKey      string
+	Material    string
+	Colour      *string
+	Finish      string
+	UnitsPerBed int32
+	Quality     string
+	InfillPct   float64
+	PreviewKey  string
+	Sku         *string
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+// Keyset page of the global "all brands" view: rows across the given brands
+// strictly before the (created_at, id) cursor, newest first. A null cursor
+// returns the first page.
+func (q *Queries) ListDesignsForBrandsPage(ctx context.Context, arg ListDesignsForBrandsPageParams) ([]ListDesignsForBrandsPageRow, error) {
+	rows, err := q.db.Query(ctx, listDesignsForBrandsPage,
+		arg.BrandSlugs,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDesignsForBrandsPageRow{}
+	for rows.Next() {
+		var i ListDesignsForBrandsPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.BrandSlug,
+			&i.Name,
+			&i.CreatedBy,
+			&i.Status,
+			&i.StlKey,
+			&i.Material,
+			&i.Colour,
+			&i.Finish,
+			&i.UnitsPerBed,
+			&i.Quality,
+			&i.InfillPct,
+			&i.PreviewKey,
+			&i.Sku,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -588,13 +1003,318 @@ func (q *Queries) NextAttemptForDesign(ctx context.Context, designID uuid.UUID) 
 	return next_attempt, err
 }
 
+const nextDesignSkuSeq = `-- name: NextDesignSkuSeq :one
+SELECT nextval('designs_sku_seq')::bigint AS seq
+`
+
+// NextDesignSkuSeq draws the next value for an auto-generated SKU's numeric suffix.
+func (q *Queries) NextDesignSkuSeq(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, nextDesignSkuSeq)
+	var seq int64
+	err := row.Scan(&seq)
+	return seq, err
+}
+
+const setDesignAttributes = `-- name: SetDesignAttributes :exec
+UPDATE designs SET attributes = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetDesignAttributesParams struct {
+	Attributes []byte
+	ID         uuid.UUID
+}
+
+func (q *Queries) SetDesignAttributes(ctx context.Context, arg SetDesignAttributesParams) error {
+	_, err := q.db.Exec(ctx, setDesignAttributes, arg.Attributes, arg.ID)
+	return err
+}
+
+const setDesignName = `-- name: SetDesignName :exec
+UPDATE designs SET name = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetDesignNameParams struct {
+	Name string
+	ID   uuid.UUID
+}
+
+func (q *Queries) SetDesignName(ctx context.Context, arg SetDesignNameParams) error {
+	_, err := q.db.Exec(ctx, setDesignName, arg.Name, arg.ID)
+	return err
+}
+
+const setDesignNotes = `-- name: SetDesignNotes :exec
+UPDATE designs SET notes = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetDesignNotesParams struct {
+	Notes *string
+	ID    uuid.UUID
+}
+
+func (q *Queries) SetDesignNotes(ctx context.Context, arg SetDesignNotesParams) error {
+	_, err := q.db.Exec(ctx, setDesignNotes, arg.Notes, arg.ID)
+	return err
+}
+
+const setDesignPersonalisation = `-- name: SetDesignPersonalisation :one
+UPDATE designs
+SET personalisation = $1,
+    personalised_stl_key = $2,
+    updated_at = now()
+WHERE id = $3
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, machine_id, personalisation_rules, attributes,
+          personalisation, personalised_stl_key, created_at, updated_at
+`
+
+type SetDesignPersonalisationParams struct {
+	Personalisation    []byte
+	PersonalisedStlKey *string
+	ID                 uuid.UUID
+}
+
+type SetDesignPersonalisationRow struct {
+	ID                   uuid.UUID
+	BrandSlug            string
+	Name                 string
+	CreatedBy            string
+	Status               string
+	StlKey               string
+	Material             string
+	Colour               *string
+	Finish               string
+	UnitsPerBed          int32
+	Quality              string
+	InfillPct            float64
+	Notes                *string
+	PreviewKey           string
+	Sku                  *string
+	MachineID            *uuid.UUID
+	PersonalisationRules []byte
+	Attributes           []byte
+	Personalisation      []byte
+	PersonalisedStlKey   *string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+// SetDesignPersonalisation stores the applied personalisation spec and the baked
+// STL key for a design (or clears both with NULLs). Returns the updated row.
+func (q *Queries) SetDesignPersonalisation(ctx context.Context, arg SetDesignPersonalisationParams) (SetDesignPersonalisationRow, error) {
+	row := q.db.QueryRow(ctx, setDesignPersonalisation, arg.Personalisation, arg.PersonalisedStlKey, arg.ID)
+	var i SetDesignPersonalisationRow
+	err := row.Scan(
+		&i.ID,
+		&i.BrandSlug,
+		&i.Name,
+		&i.CreatedBy,
+		&i.Status,
+		&i.StlKey,
+		&i.Material,
+		&i.Colour,
+		&i.Finish,
+		&i.UnitsPerBed,
+		&i.Quality,
+		&i.InfillPct,
+		&i.Notes,
+		&i.PreviewKey,
+		&i.Sku,
+		&i.MachineID,
+		&i.PersonalisationRules,
+		&i.Attributes,
+		&i.Personalisation,
+		&i.PersonalisedStlKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setDesignPersonalisationRules = `-- name: SetDesignPersonalisationRules :one
+UPDATE designs SET personalisation_rules = $1, updated_at = now()
+WHERE id = $2
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, machine_id, personalisation_rules, created_at, updated_at
+`
+
+type SetDesignPersonalisationRulesParams struct {
+	PersonalisationRules []byte
+	ID                   uuid.UUID
+}
+
+type SetDesignPersonalisationRulesRow struct {
+	ID                   uuid.UUID
+	BrandSlug            string
+	Name                 string
+	CreatedBy            string
+	Status               string
+	StlKey               string
+	Material             string
+	Colour               *string
+	Finish               string
+	UnitsPerBed          int32
+	Quality              string
+	InfillPct            float64
+	Notes                *string
+	PreviewKey           string
+	Sku                  *string
+	MachineID            *uuid.UUID
+	PersonalisationRules []byte
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+// SetDesignPersonalisationRules stores (or clears, with NULL) the product's
+// personalization rule set. The jsonb shape is validated in Go before it is set.
+func (q *Queries) SetDesignPersonalisationRules(ctx context.Context, arg SetDesignPersonalisationRulesParams) (SetDesignPersonalisationRulesRow, error) {
+	row := q.db.QueryRow(ctx, setDesignPersonalisationRules, arg.PersonalisationRules, arg.ID)
+	var i SetDesignPersonalisationRulesRow
+	err := row.Scan(
+		&i.ID,
+		&i.BrandSlug,
+		&i.Name,
+		&i.CreatedBy,
+		&i.Status,
+		&i.StlKey,
+		&i.Material,
+		&i.Colour,
+		&i.Finish,
+		&i.UnitsPerBed,
+		&i.Quality,
+		&i.InfillPct,
+		&i.Notes,
+		&i.PreviewKey,
+		&i.Sku,
+		&i.MachineID,
+		&i.PersonalisationRules,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setDesignPreviewKey = `-- name: SetDesignPreviewKey :exec
+UPDATE designs SET preview_key = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetDesignPreviewKeyParams struct {
+	PreviewKey string
+	ID         uuid.UUID
+}
+
+func (q *Queries) SetDesignPreviewKey(ctx context.Context, arg SetDesignPreviewKeyParams) error {
+	_, err := q.db.Exec(ctx, setDesignPreviewKey, arg.PreviewKey, arg.ID)
+	return err
+}
+
+const setDesignSku = `-- name: SetDesignSku :one
+UPDATE designs SET sku = $1, updated_at = now()
+WHERE id = $2
+RETURNING id, brand_slug, name, created_by, status, stl_key, material, colour,
+          finish, units_per_bed, quality, infill_pct::float8 AS infill_pct, notes,
+          preview_key, sku, created_at, updated_at
+`
+
+type SetDesignSkuParams struct {
+	Sku *string
+	ID  uuid.UUID
+}
+
+type SetDesignSkuRow struct {
+	ID          uuid.UUID
+	BrandSlug   string
+	Name        string
+	CreatedBy   string
+	Status      string
+	StlKey      string
+	Material    string
+	Colour      *string
+	Finish      string
+	UnitsPerBed int32
+	Quality     string
+	InfillPct   float64
+	Notes       *string
+	PreviewKey  string
+	Sku         *string
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+// SetDesignSku assigns (or clears) the catalog SKU. The partial unique index
+// designs_sku_key rejects a duplicate assigned SKU with a 23505 the handler maps
+// to a 409.
+func (q *Queries) SetDesignSku(ctx context.Context, arg SetDesignSkuParams) (SetDesignSkuRow, error) {
+	row := q.db.QueryRow(ctx, setDesignSku, arg.Sku, arg.ID)
+	var i SetDesignSkuRow
+	err := row.Scan(
+		&i.ID,
+		&i.BrandSlug,
+		&i.Name,
+		&i.CreatedBy,
+		&i.Status,
+		&i.StlKey,
+		&i.Material,
+		&i.Colour,
+		&i.Finish,
+		&i.UnitsPerBed,
+		&i.Quality,
+		&i.InfillPct,
+		&i.Notes,
+		&i.PreviewKey,
+		&i.Sku,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setDesignTemplateFile = `-- name: SetDesignTemplateFile :exec
+UPDATE designs SET template_file_id = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetDesignTemplateFileParams struct {
+	TemplateFileID *uuid.UUID
+	ID             uuid.UUID
+}
+
+// SetDesignTemplateFile records the file_asset that stands in for the design's
+// model in the production queue, so it is created once and reused for reprints.
+func (q *Queries) SetDesignTemplateFile(ctx context.Context, arg SetDesignTemplateFileParams) error {
+	_, err := q.db.Exec(ctx, setDesignTemplateFile, arg.TemplateFileID, arg.ID)
+	return err
+}
+
+const unarchiveDesign = `-- name: UnarchiveDesign :execrows
+UPDATE designs SET status = 'priced', updated_at = now()
+WHERE id = $1 AND status = 'archived'
+`
+
+// UnarchiveDesign restores an archived design back into the pipeline as priced, so
+// it can be reviewed and resubmitted. No-op (0 rows) if it is not archived.
+func (q *Queries) UnarchiveDesign(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, unarchiveDesign, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateDesignSpecs = `-- name: UpdateDesignSpecs :exec
 UPDATE designs SET
     material = $1, colour = $2,
     finish = $3, units_per_bed = $4,
     quality = $5, infill_pct = $6::float8,
-    status = $7, updated_at = now()
-WHERE id = $8
+    machine_id = $7,
+    status = $8, updated_at = now()
+WHERE id = $9
 `
 
 type UpdateDesignSpecsParams struct {
@@ -604,6 +1324,7 @@ type UpdateDesignSpecsParams struct {
 	UnitsPerBed int32
 	Quality     string
 	InfillPct   float64
+	MachineID   *uuid.UUID
 	Status      string
 	ID          uuid.UUID
 }
@@ -616,6 +1337,7 @@ func (q *Queries) UpdateDesignSpecs(ctx context.Context, arg UpdateDesignSpecsPa
 		arg.UnitsPerBed,
 		arg.Quality,
 		arg.InfillPct,
+		arg.MachineID,
 		arg.Status,
 		arg.ID,
 	)
